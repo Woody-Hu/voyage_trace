@@ -1,0 +1,61 @@
+[build-system]
+requires = ["setuptools>=83", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "voyage-trace"
+version = "0.1.0"
+description = "A meta-agent that collects other agents' execution traces and produces governance/optimization plans. Built on the deepagents extension mechanism."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "voyage_trace" }]
+keywords = ["agents", "tracing", "observability", "governance", "deepagents", "langgraph"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+# voyage_trace is built ON TOP OF deepagents' extension mechanism only.
+# We never vendor or fork deepagents internals; we depend on it as a library
+# and extend it through AgentMiddleware / BackendProtocol / SubAgent / tools.
+dependencies = [
+    "deepagents>=0.6.0",
+    # Storage backends
+    "psycopg[binary]>=3.2,<4",
+    "psycopg-pool>=3.2,<4",
+    # Serialization
+    "pyyaml>=6.0",
+    # deepagents already pulls langchain / langgraph transitively.
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[project.urls]
+Homepage = "https://github.com/voyage_trace/voyage_trace"
+Documentation = "https://github.com/voyage_trace/voyage_trace#readme"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

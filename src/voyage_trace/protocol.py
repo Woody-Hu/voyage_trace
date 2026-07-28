@@ -267,6 +267,9 @@ def normalise(trace: CanonicalTrace) -> CanonicalTrace:
     """Fill in missing derived fields and enforce invariants.
 
     Specifically this:
+      * Re-parents orphan spans (whose ``parent_span_id`` references a span
+        not present in the trace) to ``None`` and clears stale
+        ``dotted_order`` values throughout the orphan subtree.
       * Computes ``dotted_order`` for any span missing one (using
         :func:`make_dotted_order` from the parent).
       * Sorts spans by dotted_order.
@@ -274,6 +277,31 @@ def normalise(trace: CanonicalTrace) -> CanonicalTrace:
 
     Returns the same trace object (mutated in place) for convenience.
     """
+    # Detect orphans BEFORE the dotted_order walk. Previously orphans were
+    # fixed *after* the walk, which left their descendants with missing or
+    # stale dotted_orders that still referenced the old (absent) parent
+    # hierarchy — violating the parent-prefix invariant. By re-parenting
+    # up front and clearing stale orders in the orphan subtree, the single
+    # _assign traversal recomputes everything consistently.
+    ids = {s.span_id for s in trace.spans}
+    orphan_subtree: set[str] = set()
+    for s in trace.spans:
+        if s.parent_span_id is not None and s.parent_span_id not in ids:
+            s.parent_span_id = None
+            orphan_subtree.add(s.span_id)
+    if orphan_subtree:
+        # Propagate to descendants so their stale orders are cleared too.
+        changed = True
+        while changed:
+            changed = False
+            for s in trace.spans:
+                if s.parent_span_id in orphan_subtree and s.span_id not in orphan_subtree:
+                    orphan_subtree.add(s.span_id)
+                    changed = True
+        for s in trace.spans:
+            if s.span_id in orphan_subtree:
+                s.dotted_order = ""
+
     by_parent: dict[str | None, list[TraceSpan]] = {}
     for s in trace.spans:
         by_parent.setdefault(s.parent_span_id, []).append(s)
@@ -291,14 +319,6 @@ def normalise(trace: CanonicalTrace) -> CanonicalTrace:
 
     for root in roots:
         _assign(root, None)
-
-    # If there are spans with no parent recorded but they aren't in by_parent[None]
-    # (defensive: treat orphans as roots).
-    orphans = [s for s in trace.spans if s.parent_span_id is not None and s.parent_span_id not in {x.span_id for x in trace.spans}]
-    for orphan in orphans:
-        orphan.parent_span_id = None
-        if not orphan.dotted_order:
-            orphan.dotted_order = make_dotted_order(orphan.start_time, orphan.span_id, None)
 
     trace.spans = trace.sorted_spans()
     enforce_invariants(trace)

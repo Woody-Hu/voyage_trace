@@ -276,6 +276,90 @@ class TestNormalise:
         normalise(trace)
         assert orphan.parent_span_id is None
 
+    def test_orphan_subtree_gets_consistent_dotted_orders(self, make_span):
+        """Orphan with a child: both must get valid dotted_orders and the
+        child's must be a parent-prefix of the orphan's.
+
+        Regression: previously the orphan was re-parented *after* the
+        dotted_order walk, so its children kept missing or stale orders.
+        """
+        root = make_span(span_id="root")
+        orphan = make_span(span_id="orphan", parent_span_id="ghost", start_offset=1.0)
+        orphan_child = make_span(
+            span_id="orphan-child",
+            parent_span_id="orphan",
+            start_offset=2.0,
+        )
+        trace = CanonicalTrace(
+            trace_id="trace-001",
+            agent_id="a1",
+            spans=[root, orphan, orphan_child],
+        )
+        normalise(trace)
+        assert orphan.parent_span_id is None
+        assert orphan.dotted_order, "orphan must have a dotted_order"
+        assert orphan_child.dotted_order, "orphan child must have a dotted_order"
+        assert orphan_child.dotted_order.startswith(orphan.dotted_order + ".")
+
+    def test_orphan_subtree_deep_descendants(self, make_span):
+        """Orphan with a grandchild: the full chain must be consistent."""
+        root = make_span(span_id="root")
+        orphan = make_span(span_id="orphan", parent_span_id="ghost", start_offset=1.0)
+        mid = make_span(span_id="mid", parent_span_id="orphan", start_offset=2.0)
+        leaf = make_span(span_id="leaf", parent_span_id="mid", start_offset=3.0)
+        trace = CanonicalTrace(
+            trace_id="trace-001",
+            agent_id="a1",
+            spans=[root, orphan, mid, leaf],
+        )
+        normalise(trace)
+        assert orphan.parent_span_id is None
+        assert leaf.dotted_order.startswith(mid.dotted_order + ".")
+        assert mid.dotted_order.startswith(orphan.dotted_order + ".")
+
+    def test_orphan_subtree_stale_orders_cleared(self, make_span, utc_now):
+        """Orphan children with pre-existing (stale) dotted_orders must have
+        them recomputed relative to the new root."""
+        from voyage_trace.protocol import make_dotted_order
+
+        # Give the orphan a stale order referencing the ghost parent.
+        ghost_order = make_dotted_order(utc_now, "ghost", None)
+        orphan = make_span(span_id="orphan", parent_span_id="ghost", start_offset=1.0)
+        orphan.dotted_order = make_dotted_order(utc_now, "orphan", ghost_order)
+        orphan_child = make_span(
+            span_id="orphan-child",
+            parent_span_id="orphan",
+            start_offset=2.0,
+        )
+        orphan_child.dotted_order = make_dotted_order(
+            utc_now, "orphan-child", orphan.dotted_order
+        )
+        trace = CanonicalTrace(
+            trace_id="trace-001",
+            agent_id="a1",
+            spans=[orphan, orphan_child],
+        )
+        normalise(trace)
+        # The orphan is now a root — its order must NOT still reference ghost.
+        assert orphan.dotted_order != ghost_order
+        assert "." not in orphan.dotted_order  # root has no dot
+        # Child's order must be consistent with the new orphan order.
+        assert orphan_child.dotted_order.startswith(orphan.dotted_order + ".")
+
+    def test_orphan_subtree_passes_invariants(self, make_span):
+        """enforce_invariants must not raise on a normalised orphan subtree."""
+        root = make_span(span_id="root")
+        orphan = make_span(span_id="orphan", parent_span_id="ghost", start_offset=1.0)
+        child = make_span(span_id="child", parent_span_id="orphan", start_offset=2.0)
+        trace = CanonicalTrace(
+            trace_id="trace-001",
+            agent_id="a1",
+            spans=[root, orphan, child],
+        )
+        normalise(trace)
+        # Should not raise.
+        enforce_invariants(trace)
+
     def test_returns_same_object(self, simple_trace):
         result = normalise(simple_trace)
         assert result is simple_trace

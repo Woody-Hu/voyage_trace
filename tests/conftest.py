@@ -38,6 +38,7 @@ def storage() -> InMemoryStorage:
 def make_span(utc_now: datetime):
     """Factory that builds a real TraceSpan with sensible defaults."""
 
+    _UNSET = object()
     counter = [0]
 
     def _make(
@@ -55,7 +56,7 @@ def make_span(utc_now: datetime):
         agent_id: str = "agent-A",
         agent_name: str = "TestAgent",
         metadata: dict | None = None,
-        outputs: dict | None = None,
+        outputs: dict | None | object = _UNSET,
         source_protocol: SourceProtocol = SourceProtocol.CUSTOM,
     ) -> TraceSpan:
         counter[0] += 1
@@ -63,6 +64,10 @@ def make_span(utc_now: datetime):
             span_id = f"span-{counter[0]:04d}"
         start = utc_now + timedelta(seconds=start_offset)
         end = start + timedelta(seconds=duration) if duration is not None else None
+        # Distinguish "caller didn't pass outputs" (default to {"result":"ok"})
+        # from "caller explicitly passed None" (keep None).
+        if outputs is _UNSET:
+            outputs = {"result": "ok"}
         return TraceSpan(
             trace_id=trace_id,
             span_id=span_id,
@@ -77,7 +82,7 @@ def make_span(utc_now: datetime):
             agent_id=agent_id,
             agent_name=agent_name,
             metadata=metadata or {"name": agent_name},
-            outputs=outputs if outputs is not None else {"result": "ok"},
+            outputs=outputs,  # type: ignore[arg-type]
             source_protocol=source_protocol,
         )
 
@@ -128,9 +133,10 @@ def linear_trace(make_span) -> CanonicalTrace:
 @pytest.fixture
 def branching_trace(make_span) -> CanonicalTrace:
     """A trace with a root and two independent children (A -> {B, C})."""
-    root = make_span(span_id="root", operation_type=OperationType.INVOKE_AGENT)
+    root = make_span(span_id="root", trace_id="trace-002", operation_type=OperationType.INVOKE_AGENT)
     child_b = make_span(
         span_id="child-b",
+        trace_id="trace-002",
         parent_span_id="root",
         operation_type=OperationType.CHAT,
         start_offset=1.0,
@@ -138,6 +144,7 @@ def branching_trace(make_span) -> CanonicalTrace:
     )
     child_c = make_span(
         span_id="child-c",
+        trace_id="trace-002",
         parent_span_id="root",
         operation_type=OperationType.EXECUTE_TOOL,
         start_offset=1.5,
@@ -156,9 +163,10 @@ def branching_trace(make_span) -> CanonicalTrace:
 @pytest.fixture
 def failed_trace(make_span) -> CanonicalTrace:
     """A trace where one span failed and another needs input."""
-    root = make_span(span_id="root", operation_type=OperationType.INVOKE_AGENT)
+    root = make_span(span_id="root", trace_id="trace-003", operation_type=OperationType.INVOKE_AGENT)
     ok_child = make_span(
         span_id="ok-child",
+        trace_id="trace-003",
         parent_span_id="root",
         operation_type=OperationType.CHAT,
         start_offset=1.0,
@@ -166,6 +174,7 @@ def failed_trace(make_span) -> CanonicalTrace:
     )
     fail_child = make_span(
         span_id="fail-child",
+        trace_id="trace-003",
         parent_span_id="root",
         operation_type=OperationType.EXECUTE_TOOL,
         start_offset=2.0,
@@ -175,6 +184,7 @@ def failed_trace(make_span) -> CanonicalTrace:
     )
     input_child = make_span(
         span_id="input-child",
+        trace_id="trace-003",
         parent_span_id="root",
         operation_type=OperationType.CHAT,
         start_offset=3.0,

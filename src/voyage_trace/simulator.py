@@ -100,8 +100,12 @@ def replay(trace: CanonicalTrace) -> SimulationResult:
 
 
 def _step_from_span(span: TraceSpan) -> ReplayStep:
-    has_output = span.outputs is not None and (
-        (isinstance(span.outputs, dict) and span.outputs) or not isinstance(span.outputs, dict)
+    has_output = bool(
+        span.outputs is not None
+        and (
+            (isinstance(span.outputs, dict) and span.outputs)
+            or not isinstance(span.outputs, dict)
+        )
     )
     return ReplayStep(
         span_id=span.span_id,

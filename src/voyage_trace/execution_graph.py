@@ -399,10 +399,22 @@ def _detect_bottlenecks(graph: ExecutionGraph) -> list[str]:
         return out
     costs = [n.cost_usd for n in graph.nodes.values()]
     max_cost = max(costs) if costs else 0.0
+    avg_cost = sum(costs) / len(costs) if costs else 0.0
+    n_nodes = len(graph.nodes)
     for n in graph.nodes.values():
         if n.error_rate > 0.5 and n.calls >= 2:
             out.append(f"{n.label}: high error rate ({n.error_rate * 100:.0f}% over {n.calls} calls)")
-        if max_cost > 0 and n.cost_usd >= max_cost and n.cost_usd > 0:
+        # Cost hotspot: only meaningful when there are multiple nodes to
+        # compare against, the node carries the max cost, and that cost is
+        # both non-trivial (> $0.01) and strictly above the average — so a
+        # single-node trace or a flat-cost trace isn't flagged as noise.
+        if (
+            n_nodes > 1
+            and max_cost > 0
+            and n.cost_usd >= max_cost
+            and n.cost_usd > avg_cost
+            and n.cost_usd > 0.01
+        ):
             out.append(f"{n.label}: cost hotspot (${n.cost_usd:.4f})")
         if n.p99_duration > 0 and n.p50_duration > 0 and n.p99_duration > n.p50_duration * 10:
             out.append(

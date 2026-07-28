@@ -256,3 +256,77 @@ class TestBottleneckDetection:
         graph = build_execution_graph(trace)
         md = render_markdown(graph)
         assert "(none detected)" in md
+
+    def test_single_node_no_cost_hotspot(self, make_span):
+        """A single-node trace must not flag its only node as a cost hotspot
+        — there is nothing to compare against.
+
+        Regression: previously any node with cost_usd >= max_cost was
+        flagged, which always triggered for single-node traces.
+        """
+        from voyage_trace.protocol import normalise
+        from voyage_trace.types import CanonicalTrace
+
+        span = make_span(span_id="s1", trace_id="t1", cost_usd=0.05)
+        trace = normalise(CanonicalTrace(trace_id="t1", agent_id="a1", spans=[span]))
+        graph = build_execution_graph(trace)
+        md = render_markdown(graph)
+        # Extract the Bottlenecks section.
+        bn_section = md.split("## Bottlenecks", 1)[-1]
+        assert "cost hotspot" not in bn_section
+
+    def test_flat_cost_no_hotspot(self, make_span):
+        """Multiple nodes with equal costs must not flag any as a hotspot."""
+        from voyage_trace.protocol import normalise
+        from voyage_trace.types import CanonicalTrace
+
+        root = make_span(span_id="r", trace_id="t1", cost_usd=0.02,
+                         operation_type=OperationType.INVOKE_AGENT)
+        child = make_span(span_id="c", trace_id="t1", parent_span_id="r",
+                          cost_usd=0.02, start_offset=1.0)
+        trace = normalise(CanonicalTrace(trace_id="t1", agent_id="a1", spans=[root, child]))
+        graph = build_execution_graph(trace)
+        md = render_markdown(graph)
+        bn_section = md.split("## Bottlenecks", 1)[-1]
+        assert "cost hotspot" not in bn_section
+
+    def test_cost_hotspot_detected_with_skew(self, make_span):
+        """When one node is clearly more expensive than the others, it
+        should be flagged."""
+        from voyage_trace.protocol import normalise
+        from voyage_trace.types import CanonicalTrace
+
+        root = make_span(span_id="r", trace_id="t1", cost_usd=0.01,
+                         operation_type=OperationType.INVOKE_AGENT,
+                         metadata={"name": "Agent"})
+        expensive = make_span(span_id="e", trace_id="t1", parent_span_id="r",
+                              cost_usd=0.50, start_offset=1.0,
+                              metadata={"name": "ExpensiveLLM"})
+        cheap = make_span(span_id="c", trace_id="t1", parent_span_id="r",
+                         cost_usd=0.01, start_offset=2.0,
+                         metadata={"name": "CheapTool"})
+        trace = normalise(CanonicalTrace(trace_id="t1", agent_id="a1", spans=[root, expensive, cheap]))
+        graph = build_execution_graph(trace)
+        md = render_markdown(graph)
+        bn_section = md.split("## Bottlenecks", 1)[-1]
+        assert "cost hotspot" in bn_section
+        assert "ExpensiveLLM" in bn_section
+        assert "CheapTool" not in bn_section.split("\n")[1]  # cheap not flagged
+
+    def test_trivial_cost_not_flagged(self, make_span):
+        """Costs below the $0.01 threshold should not be flagged even if
+        one is the max among multiple nodes."""
+        from voyage_trace.protocol import normalise
+        from voyage_trace.types import CanonicalTrace
+
+        root = make_span(span_id="r", trace_id="t1", cost_usd=0.001,
+                         operation_type=OperationType.INVOKE_AGENT,
+                         metadata={"name": "Agent"})
+        child = make_span(span_id="c", trace_id="t1", parent_span_id="r",
+                          cost_usd=0.005, start_offset=1.0,
+                          metadata={"name": "Child"})
+        trace = normalise(CanonicalTrace(trace_id="t1", agent_id="a1", spans=[root, child]))
+        graph = build_execution_graph(trace)
+        md = render_markdown(graph)
+        bn_section = md.split("## Bottlenecks", 1)[-1]
+        assert "cost hotspot" not in bn_section

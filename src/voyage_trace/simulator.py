@@ -182,6 +182,16 @@ def simulate(
         if span.span_id in state.removed_nodes:
             result.divergences.append(f"node {span.span_id} removed by modification — skipped")
             continue
+        # Skip spans whose incoming parent edge was pruned by a
+        # ``remove_edge`` modification. Without this check the modification
+        # is silently ignored — the edge is recorded in ``pruned_edges`` but
+        # never consulted during the walk.
+        if span.parent_span_id is not None:
+            if (span.parent_span_id, span.span_id) in state.pruned_edges:
+                result.divergences.append(
+                    f"edge {span.parent_span_id}->{span.span_id} pruned — skipped"
+                )
+                continue
         # Enforce per-node visit caps (loop guardrails).
         visits = state.visits.get(span.span_id, 0) + 1
         cap = state.caps.get(span.span_id)

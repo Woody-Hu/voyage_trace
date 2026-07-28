@@ -97,6 +97,55 @@ class TestSimulate:
         assert "child-2" not in step_ids
         assert any("removed" in d for d in result.divergences)
 
+    def test_remove_edge_prunes_child_span(self, linear_trace):
+        """remove_edge must actually skip the target span during the walk.
+
+        Regression: ``_apply_mod`` recorded pruned edges in
+        ``state.pruned_edges`` but the walk never consulted them, so the
+        modification was silently ignored.
+        """
+        baseline = simulate(linear_trace, [])
+        result = simulate(
+            linear_trace,
+            [
+                Modification(
+                    target_node_id="child-2",
+                    kind="remove_edge",
+                    params={"source": "child-1", "target": "child-2"},
+                )
+            ],
+        )
+        step_ids = [s.span_id for s in result.steps]
+        assert "child-2" not in step_ids
+        # root and child-1 should still be present
+        assert "root" in step_ids
+        assert "child-1" in step_ids
+        # A divergence must be recorded for the pruned edge.
+        assert any("pruned" in d for d in result.divergences)
+        # The pruned span's cost/tokens must not contribute to the total.
+        pruned_span = next(s for s in linear_trace.spans if s.span_id == "child-2")
+        assert result.total_cost_usd < baseline.total_cost_usd
+        assert result.total_tokens == baseline.total_tokens - (
+            pruned_span.input_tokens + pruned_span.output_tokens
+        )
+
+    def test_remove_edge_only_affects_target_child(self, branching_trace):
+        """Pruning one edge must not affect sibling edges."""
+        result = simulate(
+            branching_trace,
+            [
+                Modification(
+                    target_node_id="child-c",
+                    kind="remove_edge",
+                    params={"source": "root", "target": "child-c"},
+                )
+            ],
+        )
+        step_ids = [s.span_id for s in result.steps]
+        assert "child-c" not in step_ids
+        assert "child-b" in step_ids  # sibling still walks
+        assert "root" in step_ids
+
     def test_cap_loops_prunes_excess_visits(self, make_span):
         from voyage_trace.protocol import normalise
         from voyage_trace.types import CanonicalTrace, OperationType

@@ -274,7 +274,7 @@ class ModelingAgent:
                     "suggestion_count": len(report.suggested_modifications),
                 },
             ))
-            step.finish(StepStatus.FAILED if report.notes and "No feature" in report.notes[0] else StepStatus.SUCCESS)
+            step.finish(StepStatus.FAILED if report.notes and any("No feature" in n for n in report.notes) else StepStatus.SUCCESS)
 
             # Turn each AutoML suggestion into a candidate proposal. AutoML
             # proposes; the simulation agent disposes.

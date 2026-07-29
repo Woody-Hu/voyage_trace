@@ -278,7 +278,11 @@ AutoML is exposed as a *tool* the modelling sub-agent calls to turn a
 collection of `CanonicalTrace` objects into a learned model of "what drives
 an outcome". It is deliberately **dependency-free** (pure-Python statistics
 — no numpy / scikit-learn) so it runs anywhere voyage_trace runs and its
-behaviour is fully auditable.
+behaviour is fully auditable. It wraps
+[AutoGluon](https://auto.gluon.ai/stable/index.html) TabularPredictor for
+model selection, hyperparameter tuning, and ensembling. AutoGluon is imported
+lazily inside `run_automl()` so the module's constants, data classes, and
+rendering functions remain importable without it installed.
 
 **How AutoML matches the Markdown-based modelling approach.** The execution
 graph's `## Nodes` table (calls, p50, p99, tokens, cost, err%) IS the
@@ -309,9 +313,9 @@ MD graph enriched          ◄──  suggested Modifications  ◄───┘
 | `FeatureMatrix` | One row per aggregated graph node; `column(name)` returns a feature or target column. |
 | `extract_feature_matrix(traces)` | Aggregates traces into one template graph, then builds a `FeatureMatrix` (same data as the MD `## Nodes` table). |
 | `feature_matrix_from_graph(graph)` | Builds a `FeatureMatrix` from a pre-aggregated graph. |
-| `TrainedModel` | One fitted model: a univariate linear regression on a single feature, or a constant mean baseline (`feature == "(mean)"`). Carries `slope`, `intercept`, `r_squared`, `rmse`. |
+| `TrainedModel` | One fitted AutoGluon model: carries `model_name` (AutoGluon model identifier), `feature` (top feature from permutation importance, or `"(mean)"` for the fallback baseline), `r_squared`, `rmse`. |
 | `AutoMLReport` | Full output of `run_automl`: `best_model`, `all_models`, `feature_importances`, `top_cost_nodes`, `high_error_nodes`, `suggested_modifications`, `notes`. `to_dict()` is JSON-safe. |
-| `run_automl(traces=None, *, graph=None, target, ...)` | The entry point. Pipeline: build matrix → fit mean baseline + one univariate model per feature → auto-select best by R² → rank features by `|Pearson r|` (normalised to sum 1) → surface top-cost/high-error nodes as candidate `Modification`s. |
+| `run_automl(traces=None, *, graph=None, target, ...)` | The entry point. Pipeline: build matrix → fit AutoGluon TabularPredictor (regression, R² metric, 2-fold CV) → extract permutation feature importances (normalised to sum 1) → evaluate best model for R²/RMSE → surface top-cost/high-error nodes as candidate `Modification`s. |
 | `render_automl_markdown(report)` | Renders `## Learned Signals` / `## Models` / `## Suggested Modifications` sections. |
 | `inject_automl_into_graph_md(graph_md, report)` | Splices those sections into an execution-graph MD doc, before `## Bottlenecks` (or appends). Closes the MD ↔ AutoML loop. |
 | `AUTOML_COT_PROMPT` | Chain-of-thought prompt seeding the modelling sub-agent: when to call AutoML (≥3 traces), how to call it, how it relates to the MD graph, what to do with the output, and the honesty contract (never present correlation as causation; echo low-sample warnings). |
@@ -324,11 +328,11 @@ MD graph enriched          ◄──  suggested Modifications  ◄───┘
 * A cost hotspot (`cost > cost_threshold`, default $0.01) → `swap_model`
   (0.3× cost, 0.8× tokens).
 
-**Honesty contract.** When no feature beats the mean baseline (R² ≤ 0),
-the report explicitly says so and recommends collecting more traces. When
-fewer than `min_samples` (default 3) traces were observed, a low-sample
-warning is appended to `notes` — the count is based on `observed_runs`
-(traces), not node count.
+**Honesty contract.** When all permutation importances are zero (no feature
+explains variance beyond the mean baseline), the report explicitly says so
+and recommends collecting more traces. When fewer than `min_samples`
+(default 3) traces were observed, a low-sample warning is appended to
+`notes` — the count is based on `observed_runs` (traces), not node count.
 
 ### `agents.py` — Multi-agent architecture
 
@@ -530,15 +534,18 @@ Stage-by-stage:
   `agentic.md` convention. Nothing about *how* a governance plan was
   produced is implicit.
 * **AutoML proposes, the simulator disposes.** AutoML is a *tool* the
-  modelling sub-agent calls — never an authority. It ranks feature
-  associations (`|Pearson r|`) and surfaces candidate `Modification`s, but
-  no candidate reaches the plan until the simulator validates it with
-  `project_savings`. Correlation is never presented as causation.
-* **Dependency-free AutoML.** `automl.py` is pure-Python statistics (no
-  numpy / scikit-learn), so its behaviour is fully auditable and it runs
-  anywhere voyage_trace runs. Its feature matrix is exactly the execution
-  graph's `## Nodes` table — the MD graph and AutoML are two views of the
-  same numbers.
+  modelling sub-agent calls — never an authority. AutoGluon ranks feature
+  associations (permutation importances) and surfaces candidate
+  `Modification`s, but no candidate reaches the plan until the simulator
+  validates it with `project_savings`. Correlation is never presented as
+  causation.
+* **AutoGluon-backed AutoML.** `automl.py` wraps
+  [AutoGluon](https://auto.gluon.ai/stable/index.html) TabularPredictor for
+  model selection and ensembling. AutoGluon is imported lazily inside
+  `run_automl()` so the module's constants, data classes, and rendering
+  functions remain importable without it. Its feature matrix is exactly the
+  execution graph's `## Nodes` table — the MD graph and AutoML are two views
+  of the same numbers.
 
 ## 5. Storage Namespace Convention
 

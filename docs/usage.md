@@ -465,10 +465,12 @@ serialised by older versions still load.
 
 `voyage_trace.automl` exposes AutoML as a *tool* that turns a collection of
 traces into a learned model of "what drives an outcome" (cost or failure).
-It is **dependency-free** (pure-Python statistics — no numpy /
-scikit-learn) and its feature matrix is exactly the execution graph's
-`## Nodes` table, so the Markdown graph and AutoML are two views of the
-same numbers.
+It wraps [AutoGluon](https://auto.gluon.ai/stable/index.html)
+TabularPredictor for model selection and ensembling, and its feature matrix
+is exactly the execution graph's `## Nodes` table, so the Markdown graph
+and AutoML are two views of the same numbers. AutoGluon is imported lazily
+inside `run_automl()` — install `autogluon.tabular` to enable model
+training.
 
 ### Running AutoML
 
@@ -479,8 +481,9 @@ from voyage_trace.automl import run_automl
 report = run_automl(traces, target="cost_usd")
 
 print(report.best_model.feature)        # e.g. "total_tokens"
+print(report.best_model.model_name)     # AutoGluon model name, e.g. "WeightedEnsemble_L2"
 print(report.best_model.r_squared)      # explanatory power
-print(report.feature_importances)       # {feature: |Pearson r| normalised to 1}
+print(report.feature_importances)       # {feature: permutation importance normalised to 1}
 print(report.suggested_modifications)   # [(Modification, rationale), ...]
 print(report.notes)                     # low-sample / no-signal warnings
 ```
@@ -499,9 +502,9 @@ report = run_automl(graph=graph, target="cost_usd")
 
 | Field | Meaning |
 |---|---|
-| `best_model` | The univariate linear model with the highest R². If no feature beats the mean baseline (R² ≤ 0), it falls back to `feature == "(mean)"` and a note explains the signal was too weak. |
-| `all_models` | The mean baseline + one model per feature. |
-| `feature_importances` | `|Pearson r|` of each feature with the target, normalised to sum to 1. These are **associations, not causal levers**. |
+| `best_model` | The AutoGluon best model (by R²). If all permutation importances are zero, it falls back to `feature == "(mean)"` and a note explains the signal was too weak. |
+| `all_models` | All models from AutoGluon's leaderboard, each with its R² score. |
+| `feature_importances` | AutoGluon permutation importances of each feature with the target, normalised to sum to 1. These are **associations, not causal levers**. |
 | `top_cost_nodes` / `high_error_nodes` | The nodes with the highest cost / error rate. |
 | `suggested_modifications` | Candidate `Modification` objects: `cap_loops` for high-error nodes, `swap_model` for cost hotspots. These MUST be validated by `simulator.simulate()` before acceptance. |
 | `notes` | Honesty warnings: low-sample size, no explanatory signal. |

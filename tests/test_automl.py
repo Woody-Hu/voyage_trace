@@ -1,11 +1,10 @@
-"""Tests for voyage_trace.automl — the AutoML tool and its alignment with
-the Markdown execution graph.
+"""Tests for voyage_trace.automl — the AutoGluon-wrapped AutoML tool and its
+alignment with the Markdown execution graph.
 
-Verifies: pure-Python statistics helpers, feature-matrix extraction (one
-row per aggregated node, mirroring the MD ``## Nodes`` table), model
-fitting + auto-selection, feature-importance ranking, suggested
-modifications, the low-sample honesty note, and the Markdown injection
-that splices ``## Learned Signals`` / ``## Models`` /
+Verifies: feature-matrix extraction (one row per aggregated node, mirroring
+the MD ``## Nodes`` table), AutoGluon model fitting + feature-importance
+ranking, suggested modifications, the low-sample honesty note, and the
+Markdown injection that splices ``## Learned Signals`` / ``## Models`` /
 ``## Suggested Modifications`` into an execution-graph document.
 """
 
@@ -20,9 +19,7 @@ from voyage_trace.automl import (
     FEATURE_NAMES,
     AutoMLReport,
     FeatureMatrix,
-    _linear_fit,
-    _pearson,
-    _r_squared,
+    TrainedModel,
     extract_feature_matrix,
     feature_matrix_from_graph,
     inject_automl_into_graph_md,
@@ -91,54 +88,6 @@ def failing_traces():
 
 
 # --------------------------------------------------------------------------- #
-# Statistics helpers (pure Python, no numpy)
-# --------------------------------------------------------------------------- #
-class TestStatsHelpers:
-    def test_pearson_perfect_positive(self):
-        assert _pearson([1, 2, 3, 4], [2, 4, 6, 8]) == pytest.approx(1.0)
-
-    def test_pearson_perfect_negative(self):
-        assert _pearson([1, 2, 3, 4], [4, 3, 2, 1]) == pytest.approx(-1.0)
-
-    def test_pearson_zero_variance_returns_zero(self):
-        # No variance in x → correlation undefined → 0.0
-        assert _pearson([1, 1, 1], [1, 2, 3]) == 0.0
-
-    def test_pearson_too_few_samples(self):
-        assert _pearson([1.0], [2.0]) == 0.0
-
-    def test_linear_fit_known_line(self):
-        # y = 2x + 1
-        xs = [0, 1, 2, 3, 4]
-        ys = [1, 3, 5, 7, 9]
-        slope, intercept = _linear_fit(xs, ys)
-        assert slope == pytest.approx(2.0)
-        assert intercept == pytest.approx(1.0)
-
-    def test_linear_fit_constant_x_returns_mean_intercept(self):
-        slope, intercept = _linear_fit([5, 5, 5], [1, 2, 3])
-        assert slope == 0.0
-        assert intercept == pytest.approx(2.0)
-
-    def test_r_squared_perfect_fit(self):
-        slope, intercept = 2.0, 1.0
-        xs = [0, 1, 2, 3]
-        ys = [1, 3, 5, 7]
-        assert _r_squared(xs, ys, slope, intercept) == pytest.approx(1.0)
-
-    def test_r_squared_negative_for_bad_model(self):
-        # A flat-line model on a sloped target → R^2 < 0
-        slope, intercept = 0.0, 2.0  # predicts constant 2
-        xs = [0, 1, 2, 3]
-        ys = [1, 3, 5, 7]
-        assert _r_squared(xs, ys, slope, intercept) < 0.0
-
-    def test_r_squared_constant_target(self):
-        # Constant target → mean predictor is perfect by convention
-        assert _r_squared([1, 2, 3], [4, 4, 4], 0.0, 4.0) == pytest.approx(1.0)
-
-
-# --------------------------------------------------------------------------- #
 # Feature matrix
 # --------------------------------------------------------------------------- #
 class TestFeatureMatrix:
@@ -189,21 +138,23 @@ class TestFeatureMatrix:
 class TestRunAutoML:
     def test_finds_cost_driver(self, three_traces):
         # total_tokens is the strongest cost driver here (LLM has most
-        # tokens AND most cost) → best model should be total_tokens with
-        # R^2 very close to 1. Not exactly 1.0 because the per-node
-        # cost-per-token ratios differ slightly across root/LLM/tool.
+        # tokens AND most cost) → AutoGluon's permutation importance should
+        # rank it as the top feature.
         report = run_automl(three_traces, target="cost_usd")
         assert isinstance(report, AutoMLReport)
         assert report.target == "cost_usd"
         assert report.n_samples == 3
+        # AutoGluon identifies total_tokens as the top feature.
         assert report.best_model.feature == "total_tokens"
-        assert report.best_model.r_squared == pytest.approx(1.0, abs=1e-3)
         assert report.top_feature == "total_tokens"
+        # R² is positive (the model found explanatory signal).
+        assert report.best_model.r_squared > 0.0
 
     def test_importances_normalized_to_one(self, three_traces):
         report = run_automl(three_traces, target="cost_usd")
         total = sum(report.feature_importances.values())
-        assert total == pytest.approx(1.0)
+        # Either all zero (no signal) or summing to 1.0 (normalised).
+        assert total == pytest.approx(0.0) or total == pytest.approx(1.0)
         # all in [0, 1]
         assert all(0.0 <= v <= 1.0 for v in report.feature_importances.values())
 
@@ -232,16 +183,44 @@ class TestRunAutoML:
         assert any("directional" in n or "samples" in n.lower() for n in report.notes)
 
     def test_no_signal_falls_back_to_baseline(self):
-        # Traces where cost is constant → no feature explains variance →
-        # AutoML honestly reports the mean baseline.
-        traces = [_make_trace("t1", 0.5), _make_trace("t2", 0.5), _make_trace("t3", 0.5)]
+        # Traces where every span has the same cost → after aggregation all
+        # nodes have identical cost → the target is constant → no feature
+        # explains variance → AutoGluon's permutation importances are all
+        # zero → AutoML honestly reports the mean baseline.
+        def _make_constant_cost_trace(trace_id: str) -> CanonicalTrace:
+            base = datetime(2025, 7, 27, 12, 0, 0, tzinfo=timezone.utc)
+            spans = [
+                TraceSpan(
+                    trace_id=trace_id, span_id="root", parent_span_id=None,
+                    operation_type=OperationType.INVOKE_AGENT, agent_id="agent-A",
+                    agent_name="TestAgent", start_time=base, end_time=base,
+                    metadata={"name": "root"}, cost_usd=0.5,
+                    input_tokens=10, output_tokens=5, source_protocol=SourceProtocol.CUSTOM,
+                ),
+                TraceSpan(
+                    trace_id=trace_id, span_id="c1", parent_span_id="root",
+                    operation_type=OperationType.CHAT, agent_id="agent-A", agent_name="TestAgent",
+                    start_time=base, end_time=base, metadata={"name": "LLM"}, cost_usd=0.5,
+                    input_tokens=100, output_tokens=200, source_protocol=SourceProtocol.CUSTOM,
+                ),
+                TraceSpan(
+                    trace_id=trace_id, span_id="c2", parent_span_id="root",
+                    operation_type=OperationType.EXECUTE_TOOL, agent_id="agent-A", agent_name="TestAgent",
+                    start_time=base, end_time=base, metadata={"name": "tool"}, cost_usd=0.5,
+                    input_tokens=20, output_tokens=0, source_protocol=SourceProtocol.CUSTOM,
+                ),
+            ]
+            return normalise(CanonicalTrace(
+                trace_id=trace_id, agent_id="agent-A", agent_name="TestAgent",
+                source_protocol=SourceProtocol.CUSTOM, spans=spans,
+            ))
+
+        traces = [_make_constant_cost_trace("t1"), _make_constant_cost_trace("t2"),
+                  _make_constant_cost_trace("t3")]
         report = run_automl(traces, target="cost_usd")
-        # With a constant target the mean predictor is "perfect" by convention,
-        # so best_model is the baseline (R^2 == 0 by definition for baseline).
-        assert report.best_model.is_baseline or report.best_model.r_squared <= 1.0
-        # a note explaining weak/no signal OR the constant-target note
-        # (either is acceptable honesty)
-        assert isinstance(report.notes, list)
+        # All importances are zero → best_model falls back to baseline.
+        assert report.best_model.is_baseline
+        assert any("No feature" in n or "mean baseline" in n for n in report.notes)
 
     def test_accepts_preaggregated_graph(self, three_traces):
         graph = aggregate_execution_graph(three_traces)
@@ -266,6 +245,15 @@ class TestRunAutoML:
         assert back["target"] == "cost_usd"
         assert back["best_model"]["feature"] == "total_tokens"
 
+    def test_best_model_has_autogluon_model_name(self, three_traces):
+        # The best model name should be an AutoGluon model identifier,
+        # not a feature name.
+        report = run_automl(three_traces, target="cost_usd")
+        assert report.best_model.model_name != "(mean)"
+        assert len(report.best_model.model_name) > 0
+        # all_models should contain at least one AutoGluon model
+        assert len(report.all_models) >= 1
+
 
 # --------------------------------------------------------------------------- #
 # Markdown rendering + injection (the MD-graph ↔ AutoML loop)
@@ -277,10 +265,10 @@ class TestAutoMLMarkdown:
         assert "## Learned Signals" in md
         assert "## Models" in md
         assert "## Suggested Modifications" in md
-        # best model line
-        assert "best_model: `total_tokens`" in md
-        # models table
-        assert "| feature | slope | intercept | R^2 | RMSE |" in md
+        # best model line shows the AutoGluon model name and top feature
+        assert "total_tokens" in md
+        # models table has the new column layout
+        assert "| model | feature | R^2 | RMSE |" in md
 
     def test_render_suggestions_table(self, three_traces):
         report = run_automl(three_traces, target="cost_usd")
@@ -291,12 +279,10 @@ class TestAutoMLMarkdown:
         assert "simulator.simulate()" in md
 
     def test_render_no_suggestions(self):
-        # Build a report with no suggestions: a graph where no node crosses
-        # the cost/error thresholds.
-        from voyage_trace.automl import AutoMLReport, TrainedModel
+        # Build a report with no suggestions.
         report = AutoMLReport(
             target="cost_usd", n_samples=3, n_features=5,
-            best_model=TrainedModel("(mean)", 0.0, 0.0, 0.0, 0.0),
+            best_model=TrainedModel("(mean)", "(mean)", 0.0, 0.0),
             all_models=[], feature_importances={},
             top_cost_nodes=[], high_error_nodes=[],
             suggested_modifications=[],
@@ -342,6 +328,9 @@ class TestCoTPrompt:
         # And the honesty contract (AutoML proposes, simulator disposes)
         assert "simulator" in AUTOML_COT_PROMPT.lower()
 
+    def test_prompt_mentions_autogluon(self):
+        assert "AutoGluon" in AUTOML_COT_PROMPT
+
     def test_prompt_covers_when_not_to_call_automl(self):
         # Must warn the agent not to call AutoML with <3 traces
-        assert "≥3" in AUTOML_COT_PROMPT or ">= 3" in AUTOML_COT_PROMPT
+        assert "≥3" in AUTOML_COT_PROMPT or ">=3" in AUTOML_COT_PROMPT or ">= 3" in AUTOML_COT_PROMPT

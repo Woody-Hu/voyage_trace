@@ -1,11 +1,15 @@
 """AutoML as a tool for trace-driven modelling analysis.
 
-This module exposes AutoML as a *tool* the meta-agent can call to turn a
-collection of :class:`~voyage_trace.types.CanonicalTrace` objects into a
-learned model of "what drives an outcome". It is deliberately
-dependency-free (pure-Python statistics — no numpy / scikit-learn) so it
-runs anywhere voyage_trace runs, and so its behaviour is fully auditable:
-every number it produces can be reproduced with a calculator.
+This module wraps `AutoGluon <https://auto.gluon.ai/stable/index.html>`_
+:class:`~autogluon.tabular.TabularPredictor` to turn a collection of
+:class:`~voyage_trace.types.CanonicalTrace` objects into a learned model of
+"what drives an outcome". AutoGluon handles model selection, hyperparameter
+tuning, and ensembling; this module adapts its output to voyage_trace's
+Markdown + Modification workflow.
+
+AutoGluon is imported lazily inside :func:`run_automl` so that the module's
+constants, data classes, and rendering functions remain importable without
+AutoGluon installed — only the actual model training requires it.
 
 How AutoML matches the existing Markdown-based modelling approach
 -----------------------------------------------------------------
@@ -24,7 +28,7 @@ into one loop:
     (## Learned Signals,             (validated by simulator)
      ## Proposed Modifications)
 
-* ``## Learned Signals`` — feature importances AutoML discovered, spliced
+* ``## Learned Signals`` — feature importances AutoGluon discovered, spliced
   back into the same MD document so a human reviewer sees the descriptive
   stats and the explanatory stats side by side.
 * ``## Proposed Modifications`` — concrete
@@ -43,91 +47,13 @@ sub-agent (see :mod:`voyage_trace.agents`) is seeded with.
 
 from __future__ import annotations
 
-import statistics
+import tempfile
 from dataclasses import dataclass, field
 from typing import Any
 
 from .execution_graph import ExecutionGraph, aggregate_execution_graph
 from .simulator import Modification
 from .types import CanonicalTrace
-
-
-# --------------------------------------------------------------------------- #
-# Pure-Python statistics helpers (no numpy)
-# --------------------------------------------------------------------------- #
-def _mean(xs: list[float]) -> float:
-    return sum(xs) / len(xs) if xs else 0.0
-
-
-def _variance(xs: list[float]) -> float:
-    if len(xs) < 2:
-        return 0.0
-    m = _mean(xs)
-    return sum((x - m) ** 2 for x in xs) / (len(xs) - 1)
-
-
-def _std(xs: list[float]) -> float:
-    return _variance(xs) ** 0.5
-
-
-def _pearson(xs: list[float], ys: list[float]) -> float:
-    """Pearson correlation, or 0.0 when undefined (degenerate input)."""
-    n = min(len(xs), len(ys))
-    if n < 2:
-        return 0.0
-    xs = xs[:n]
-    ys = ys[:n]
-    sx, sy = _std(xs), _std(ys)
-    if sx == 0.0 or sy == 0.0:
-        return 0.0
-    mx, my = _mean(xs), _mean(ys)
-    cov = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / (n - 1)
-    return cov / (sx * sy)
-
-
-def _linear_fit(xs: list[float], ys: list[float]) -> tuple[float, float]:
-    """Ordinary least-squares fit ``y = slope * x + intercept``.
-
-    Returns ``(0.0, mean(ys))`` when the fit is undefined (no variance in x).
-    """
-    n = min(len(xs), len(ys))
-    if n < 2:
-        return 0.0, _mean(ys)
-    xs = xs[:n]
-    ys = ys[:n]
-    mx, my = _mean(xs), _mean(ys)
-    denom = sum((x - mx) ** 2 for x in xs)
-    if denom == 0.0:
-        return 0.0, my
-    slope = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / denom
-    intercept = my - slope * mx
-    return slope, intercept
-
-
-def _r_squared(xs: list[float], ys: list[float], slope: float, intercept: float) -> float:
-    """Coefficient of determination ``R^2`` of a linear fit.
-
-    Can be negative (model worse than the mean) — that is the signal that
-    the feature carries no explanatory power, which is exactly what
-    feature-importance ranking needs.
-    """
-    n = min(len(xs), len(ys))
-    if n < 2:
-        return 0.0
-    my = _mean(ys)
-    ss_tot = sum((y - my) ** 2 for y in ys)
-    if ss_tot == 0.0:
-        # Target is constant: a mean predictor is "perfect" by convention.
-        return 1.0 if all(y == my for y in ys) else 0.0
-    ss_res = sum((y - (slope * x + intercept)) ** 2 for x, y in zip(xs, ys))
-    return 1.0 - ss_res / ss_tot
-
-
-def _rmse(xs: list[float], ys: list[float], slope: float, intercept: float) -> float:
-    n = min(len(xs), len(ys))
-    if n == 0:
-        return 0.0
-    return (sum((y - (slope * x + intercept)) ** 2 for x, y in zip(xs, ys)) / n) ** 0.5
 
 
 # --------------------------------------------------------------------------- #
@@ -240,21 +166,22 @@ def feature_matrix_from_graph(graph: ExecutionGraph) -> FeatureMatrix:
 # --------------------------------------------------------------------------- #
 @dataclass
 class TrainedModel:
-    """One fitted model. Either a univariate linear regression on a single
-    feature, or a constant mean baseline (when ``feature == "(mean)"``)."""
+    """One fitted AutoGluon model.
 
+    ``model_name`` is the AutoGluon model identifier (e.g.
+    ``WeightedEnsemble_L2``). ``feature`` is the top feature from
+    AutoGluon's permutation importance, or ``"(mean)"`` for the fallback
+    mean baseline.
+    """
+
+    model_name: str
     feature: str
-    slope: float
-    intercept: float
     r_squared: float
     rmse: float
 
     @property
     def is_baseline(self) -> bool:
         return self.feature == "(mean)"
-
-    def predict(self, x: float) -> float:
-        return self.slope * x + self.intercept
 
 
 @dataclass
@@ -270,7 +197,7 @@ class AutoMLReport:
     n_features: int
     best_model: TrainedModel
     all_models: list[TrainedModel]
-    # {feature: importance in [0,1]}, importance = |correlation| normalised.
+    # {feature: importance in [0,1]}, normalised permutation importance.
     feature_importances: dict[str, float]
     top_cost_nodes: list[tuple[str, float]]  # (node_id, cost_usd)
     high_error_nodes: list[tuple[str, float]]  # (node_id, error_rate)
@@ -279,7 +206,7 @@ class AutoMLReport:
 
     @property
     def top_feature(self) -> str:
-        """The most important feature (highest |correlation| with target)."""
+        """The most important feature (highest importance with target)."""
         if not self.feature_importances:
             return "(none)"
         return max(self.feature_importances, key=self.feature_importances.get)
@@ -290,16 +217,17 @@ class AutoMLReport:
             "n_samples": self.n_samples,
             "n_features": self.n_features,
             "best_model": {
+                "model_name": self.best_model.model_name,
                 "feature": self.best_model.feature,
-                "slope": self.best_model.slope,
-                "intercept": self.best_model.intercept,
                 "r_squared": self.best_model.r_squared,
                 "rmse": self.best_model.rmse,
             },
             "all_models": [
                 {
-                    "feature": m.feature, "slope": m.slope, "intercept": m.intercept,
-                    "r_squared": m.r_squared, "rmse": m.rmse,
+                    "model_name": m.model_name,
+                    "feature": m.feature,
+                    "r_squared": m.r_squared,
+                    "rmse": m.rmse,
                 }
                 for m in self.all_models
             ],
@@ -315,7 +243,7 @@ class AutoMLReport:
 
 
 # --------------------------------------------------------------------------- #
-# AutoML entry point
+# AutoML entry point (wraps AutoGluon TabularPredictor)
 # --------------------------------------------------------------------------- #
 def run_automl(
     traces: list[CanonicalTrace] | None = None,
@@ -325,26 +253,36 @@ def run_automl(
     cost_threshold: float = 0.01,
     error_threshold: float = 0.5,
     min_samples: int = 3,
+    time_limit: float | None = None,
+    **fit_kwargs: Any,
 ) -> AutoMLReport:
     """Run AutoML over a set of traces (or a pre-aggregated graph).
 
-    Pipeline:
+    Wraps :class:`autogluon.tabular.TabularPredictor` to learn which
+    per-node features drive the target outcome. Pipeline:
 
     1. Build the :class:`FeatureMatrix` (one row per node — the same data
-       as the MD ``## Nodes`` table).
-    2. Fit a mean baseline + one univariate linear model per feature.
-    3. Auto-select the best model by ``R^2`` (the mean baseline is the
-       floor; if no feature beats it, the report says so honestly).
-    4. Rank features by ``|correlation|`` with the target → importances.
+       as the MD ``## Nodes`` table) and convert to a ``pandas.DataFrame``.
+    2. Fit AutoGluon's ``TabularPredictor`` (regression, ``r2`` metric)
+       with cross-validation (``num_bag_folds=2``) so it works even with
+       the tiny datasets typical of trace analysis.
+    3. Extract permutation feature importances and normalise to ``[0, 1]``.
+    4. Evaluate the best model in-sample for R² and RMSE.
     5. Surface top-cost / high-error nodes and turn them into candidate
        :class:`~voyage_trace.simulator.Modification` objects (to be
        validated later by :func:`~voyage_trace.simulator.simulate`).
 
+    AutoGluon is imported lazily — if it is not installed, a
+    :class:`ImportError` is raised with a helpful message.
+
     The candidate modifications are intentionally conservative: a
     ``swap_model`` is only suggested for a cost hotspot, and a
-    ``cap_loops`` only for a high-call node. The simulator — not AutoML —
+    ``cap_loops`` only for a high-error node. The simulator — not AutoML —
     decides whether a candidate is actually beneficial.
     """
+    import pandas as pd
+
+    # --- build feature matrix -------------------------------------------- #
     if graph is None:
         if not traces:
             raise ValueError("run_automl requires either `traces` or `graph`")
@@ -361,49 +299,117 @@ def run_automl(
     n = len(y)
     notes: list[str] = []
 
-    # --- fit models ------------------------------------------------------- #
-    # Mean baseline: slope 0, intercept = mean(y). R^2 of the mean predictor
-    # is 0 by definition (it explains no variance beyond the mean).
-    mean_y = _mean(y) if y else 0.0
-    baseline = TrainedModel(
-        feature="(mean)", slope=0.0, intercept=mean_y,
-        r_squared=0.0,
-        rmse=(statistics.pstdev(y) if y else 0.0),
-    )
-    models: list[TrainedModel] = [baseline]
-    for feat in FEATURE_NAMES:
-        x = matrix.column(feat)
-        slope, intercept = _linear_fit(x, y)
-        r2 = _r_squared(x, y, slope, intercept)
-        rmse = _rmse(x, y, slope, intercept)
-        models.append(TrainedModel(feature=feat, slope=slope, intercept=intercept,
-                                   r_squared=r2, rmse=rmse))
-
-    best = max(models, key=lambda m: m.r_squared)
-    # If no feature beats the baseline, be explicit: AutoML did not find a
-    # signal. This is the honest "no free lunch" outcome for tiny samples.
-    if not best.is_baseline and best.r_squared <= 0.0:
-        notes.append(
-            f"No feature explained more variance than the mean baseline "
-            f"(best R^2={best.r_squared:.3f} for {best.feature}). "
-            f"Recommend collecting more traces before trusting any modification."
-        )
-        best = baseline
-
-    # --- feature importances (|correlation|, normalised to sum to 1) ------ #
-    importances: dict[str, float] = {}
-    for feat in FEATURE_NAMES:
-        x = matrix.column(feat)
-        importances[feat] = abs(_pearson(x, y))
-    total = sum(importances.values())
-    if total > 0:
-        importances = {k: v / total for k, v in importances.items()}
-
-    # --- node-level signals → candidate modifications -------------------- #
-    # Re-aggregate to get per-node cost/error in a stable order.
+    # Re-aggregate to get per-node cost/error for suggestions + trace count.
     if graph is None:
         assert traces is not None
         graph = aggregate_execution_graph(traces)
+    n_traces = graph.observed_runs
+    if n_traces < min_samples:
+        notes.append(
+            f"Only {n_traces} trace(s); AutoML results are directional, not statistically robust. "
+            f"Aggregate at least {min_samples} traces before acting on importances."
+        )
+
+    # --- build DataFrame for AutoGluon ----------------------------------- #
+    df_data: dict[str, list[float]] = {feat: matrix.column(feat) for feat in FEATURE_NAMES}
+    df_data[target] = y
+    df = pd.DataFrame(df_data)
+
+    # --- fit AutoGluon --------------------------------------------------- #
+    from autogluon.tabular import TabularPredictor
+
+    all_models: list[TrainedModel] = []
+    best_model: TrainedModel
+    importances: dict[str, float]
+
+    with tempfile.TemporaryDirectory() as model_dir:
+        predictor = TabularPredictor(
+            label=target,
+            path=model_dir,
+            problem_type="regression",
+            eval_metric="r2",
+            verbosity=0,
+        )
+        predictor.fit(
+            df,
+            num_bag_folds=2,
+            num_bag_sets=1,
+            num_stack_levels=0,
+            time_limit=time_limit,
+            raise_on_no_models_fitted=False,
+            **fit_kwargs,
+        )
+
+        trained_names = predictor.model_names()
+        if not trained_names:
+            # AutoGluon could not train any model (e.g. degenerate data).
+            notes.append(
+                "AutoGluon could not train any model on the provided data; "
+                "falling back to the mean baseline. Recommend collecting more traces."
+            )
+            best_model = TrainedModel(
+                model_name="(mean)", feature="(mean)",
+                r_squared=0.0, rmse=0.0,
+            )
+            importances = {feat: 0.0 for feat in FEATURE_NAMES}
+        else:
+            # --- feature importance (permutation) ---------------------- #
+            raw_fi: dict[str, float] = {}
+            try:
+                fi_df = predictor.feature_importance(df, silent=True)
+                for feat in FEATURE_NAMES:
+                    if feat in fi_df.index:
+                        raw_fi[feat] = abs(float(fi_df.loc[feat, "importance"]))
+                    else:
+                        raw_fi[feat] = 0.0
+            except Exception:
+                raw_fi = {feat: 0.0 for feat in FEATURE_NAMES}
+
+            total_imp = sum(raw_fi.values())
+            if total_imp > 0:
+                importances = {k: v / total_imp for k, v in raw_fi.items()}
+            else:
+                importances = raw_fi  # all zeros
+
+            # --- evaluate best model ----------------------------------- #
+            scores = predictor.evaluate(df, auxiliary_metrics=True, silent=True)
+            best_r2 = float(scores.get("r2", 0.0))
+            # AutoGluon returns RMSE negated (higher-is-better convention).
+            best_rmse = abs(float(scores.get("root_mean_squared_error", 0.0)))
+
+            best_model_name = str(predictor.model_best)
+            top_feat = max(importances, key=importances.get) if total_imp > 0 else "(mean)"
+
+            best_model = TrainedModel(
+                model_name=best_model_name,
+                feature=top_feat,
+                r_squared=best_r2,
+                rmse=best_rmse,
+            )
+
+            # --- leaderboard → all_models ------------------------------ #
+            lb = predictor.leaderboard(df, silent=True)
+            for _, row in lb.iterrows():
+                all_models.append(TrainedModel(
+                    model_name=str(row["model"]),
+                    feature=top_feat,
+                    r_squared=float(row.get("score_test", 0.0)),
+                    rmse=0.0,  # not available from leaderboard
+                ))
+
+    # --- no-signal honesty check ----------------------------------------- #
+    if sum(importances.values()) == 0.0:
+        notes.append(
+            "No feature explained more variance than the mean baseline "
+            "(all permutation importances are zero). "
+            "Recommend collecting more traces before trusting any modification."
+        )
+        best_model = TrainedModel(
+            model_name="(mean)", feature="(mean)",
+            r_squared=0.0, rmse=best_model.rmse,
+        )
+
+    # --- node-level signals → candidate modifications -------------------- #
     top_cost = sorted(
         ((nid, graph.nodes[nid].cost_usd) for nid in graph.nodes),
         key=lambda kv: kv[1], reverse=True,
@@ -450,22 +456,12 @@ def run_automl(
             f"Node {nid} is a cost hotspot (${cost:.4f}); candidate cheaper-model swap.",
         ))
 
-    # The low-sample warning is about the number of TRACES observed (the
-    # governance signal), not the number of nodes (rows in the matrix).
-    # ``n`` is the row count; ``graph.observed_runs`` is the trace count.
-    n_traces = graph.observed_runs
-    if n_traces < min_samples:
-        notes.append(
-            f"Only {n_traces} trace(s); AutoML results are directional, not statistically robust. "
-            f"Aggregate at least {min_samples} traces before acting on importances."
-        )
-
     return AutoMLReport(
         target=target,
         n_samples=n,
         n_features=len(FEATURE_NAMES),
-        best_model=best,
-        all_models=models,
+        best_model=best_model,
+        all_models=all_models,
         feature_importances=importances,
         top_cost_nodes=top_cost[:5],
         high_error_nodes=high_error[:5],
@@ -491,8 +487,9 @@ def render_automl_markdown(report: AutoMLReport) -> str:
     lines.append("## Learned Signals")
     lines.append(f"- target: `{report.target}`")
     lines.append(f"- samples: {report.n_samples}")
-    lines.append(f"- best_model: `{report.best_model.feature}` "
-                 f"(R^2={report.best_model.r_squared:.3f}, "
+    lines.append(f"- best_model: `{report.best_model.model_name}` "
+                 f"(feature: `{report.best_model.feature}`, "
+                 f"R^2={report.best_model.r_squared:.3f}, "
                  f"RMSE={report.best_model.rmse:.4f})")
     lines.append("- feature_importances:")
     for feat, imp in sorted(report.feature_importances.items(),
@@ -511,11 +508,11 @@ def render_automl_markdown(report: AutoMLReport) -> str:
     lines.append("")
 
     lines.append("## Models")
-    lines.append("| feature | slope | intercept | R^2 | RMSE |")
-    lines.append("|---|---|---|---|---|")
+    lines.append("| model | feature | R^2 | RMSE |")
+    lines.append("|---|---|---|---|")
     for m in report.all_models:
         lines.append(
-            f"| {m.feature} | {m.slope:.6f} | {m.intercept:.6f} | "
+            f"| {m.model_name} | {m.feature} | "
             f"{m.r_squared:.4f} | {m.rmse:.6f} |"
         )
     lines.append("")
@@ -562,17 +559,19 @@ AUTOML_COT_PROMPT = """\
 You are the **modelling sub-agent** in the voyage_trace governance pipeline.
 You have access to one tool — `voyage_trace.automl.run_automl` — that turns a
 collection of traces into a learned model of what drives an outcome (cost or
-failure). Use it deliberately. Think step by step.
+failure). It wraps `AutoGluon <https://auto.gluon.ai/stable/index.html>`_
+TabularPredictor for model selection and ensembling. Use it deliberately.
+Think step by step.
 
 ## When to call AutoML (and when NOT to)
-1. Do you have ≥3 traces of the SAME target agent? If NO → do NOT call AutoML
+1. Do you have >=3 traces of the SAME target agent? If NO -> do NOT call AutoML
    yet. With <3 samples the importances are directional only; instead, build
    the execution graph (descriptive MD) and stop. Record this decision as an
    `AnalysisStep(kind=MODEL)` with rationale "insufficient samples for AutoML".
 2. Is there a concrete outcome to explain (total cost too high? a node failing
-   repeatedly?). If NO → call AutoML with the default target `cost_usd` purely
+   repeatedly?). If NO -> call AutoML with the default target `cost_usd` purely
    to surface feature importances, but do NOT propose modifications.
-3. If YES to both → proceed.
+3. If YES to both -> proceed.
 
 ## How to call it
 - Input: a list of `CanonicalTrace` (or a pre-aggregated `ExecutionGraph`).
@@ -597,14 +596,15 @@ Modifications` right next to the `## Nodes` table in one document.
 2. Do NOT accept proposals yourself. Hand them to the **simulation sub-agent**,
    which validates each with `simulator.simulate()` and fills in
    `expected_savings`. AutoML proposes; the simulator disposes.
-3. If `best_model.feature == "(mean)"` or R^2 ≤ 0, record an
+3. If `best_model.feature == "(mean)"` or all importances are zero, record an
    `AnalysisStep(kind=MODEL)` with rationale "AutoML found no explanatory
    signal above the mean baseline" and SKIP proposal generation.
 
 ## Honesty contract
 - Never present a correlation as causation. `feature_importances` are
-  `|Pearson r|` normalised — they rank associations, they do not prove a
-  lever will work. Only the simulator's `project_savings` can do that.
+  AutoGluon permutation importances normalised to [0, 1] — they rank
+  associations, they do not prove a lever will work. Only the simulator's
+  `project_savings` can do that.
 - If `report.notes` warns about low sample size, echo that warning into the
   governance plan summary. Do not suppress it.
 - Record EVERY call to AutoML as an `AnalysisStep` (inputs: target +

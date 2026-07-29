@@ -14,6 +14,9 @@ partitioned memory, and JSON serialisation.
 5. [Storage Backends](#5-storage-backends)
 6. [Partitioned Memory](#6-partitioned-memory)
 7. [JSON Serialization](#7-json-serialization)
+8. [AutoML — Trace-Driven Modelling](#8-automl--trace-driven-modelling)
+9. [Analysis Records — The Internal Data Format](#9-analysis-records--the-internal-data-format)
+10. [Multi-Agent Orchestrator](#10-multi-agent-orchestrator)
 
 ---
 
@@ -455,3 +458,281 @@ trace3 = trace_from_dict(d)
 accepts either `str` or `bytes`. Unknown keys are ignored when
 deserialising, and missing optional keys fall back to defaults, so traces
 serialised by older versions still load.
+
+---
+
+## 8. AutoML — Trace-Driven Modelling
+
+`voyage_trace.automl` exposes AutoML as a *tool* that turns a collection of
+traces into a learned model of "what drives an outcome" (cost or failure).
+It wraps [AutoGluon](https://auto.gluon.ai/stable/index.html)
+TabularPredictor for model selection and ensembling, and its feature matrix
+is exactly the execution graph's `## Nodes` table, so the Markdown graph
+and AutoML are two views of the same numbers. AutoGluon is imported lazily
+inside `run_automl()` — install `autogluon.tabular` to enable model
+training.
+
+### Running AutoML
+
+```python
+from voyage_trace.automl import run_automl
+
+# Run over a list of traces (>=3 recommended); default target is cost_usd.
+report = run_automl(traces, target="cost_usd")
+
+print(report.best_model.feature)        # e.g. "total_tokens"
+print(report.best_model.model_name)     # AutoGluon model name, e.g. "WeightedEnsemble_L2"
+print(report.best_model.r_squared)      # explanatory power
+print(report.feature_importances)       # {feature: permutation importance normalised to 1}
+print(report.suggested_modifications)   # [(Modification, rationale), ...]
+print(report.notes)                     # low-sample / no-signal warnings
+```
+
+You can also run AutoML over a pre-aggregated graph:
+
+```python
+from voyage_trace.automl import run_automl
+from voyage_trace.execution_graph import aggregate_execution_graph
+
+graph = aggregate_execution_graph(traces)
+report = run_automl(graph=graph, target="cost_usd")
+```
+
+### What AutoML produces
+
+| Field | Meaning |
+|---|---|
+| `best_model` | The AutoGluon best model (by R²). If all permutation importances are zero, it falls back to `feature == "(mean)"` and a note explains the signal was too weak. |
+| `all_models` | All models from AutoGluon's leaderboard, each with its R² score. |
+| `feature_importances` | AutoGluon permutation importances of each feature with the target, normalised to sum to 1. These are **associations, not causal levers**. |
+| `top_cost_nodes` / `high_error_nodes` | The nodes with the highest cost / error rate. |
+| `suggested_modifications` | Candidate `Modification` objects: `cap_loops` for high-error nodes, `swap_model` for cost hotspots. These MUST be validated by `simulator.simulate()` before acceptance. |
+| `notes` | Honesty warnings: low-sample size, no explanatory signal. |
+
+### Enriching the Markdown execution graph
+
+AutoML's output is designed to be spliced back into the execution-graph
+Markdown so a human reviewer sees descriptive and explanatory stats side
+by side:
+
+```python
+from voyage_trace.automl import run_automl, inject_automl_into_graph_md
+from voyage_trace.execution_graph import aggregate_execution_graph, render_markdown
+
+graph = aggregate_execution_graph(traces)
+graph_md = render_markdown(graph)
+report = run_automl(traces, target="cost_usd")
+
+# Inserts ## Learned Signals / ## Models / ## Suggested Modifications
+# before ## Bottlenecks (or appends if absent).
+enriched_md = inject_automl_into_graph_md(graph_md, report)
+```
+
+The result is one Markdown document containing the `## Nodes` table
+(descriptive), the `## Learned Signals` (explanatory), and the
+`## Suggested Modifications` (actionable candidates) — closing the
+MD-graph ↔ AutoML loop.
+
+### The CoT prompt for the modelling sub-agent
+
+`AUTOML_COT_PROMPT` is the chain-of-thought guidance a real LLM modelling
+sub-agent would be seeded with. It covers:
+
+* **When to call AutoML** — only with ≥3 traces of the same target agent;
+  with fewer, build the descriptive graph only and record the decision.
+* **How AutoML relates to the MD graph** — the `## Nodes` table IS the
+  feature matrix; the agent's job is to merge the two views via
+  `inject_automl_into_graph_md`.
+* **What to do with the output** — turn each suggestion into an
+  `OptimizationProposal`, but **never accept proposals itself**; hand them
+  to the simulation sub-agent.
+* **The honesty contract** — never present correlation as causation; echo
+  low-sample warnings into the governance plan summary; record every call
+  as an `AnalysisStep`.
+
+---
+
+## 9. Analysis Records — The Internal Data Format
+
+`voyage_trace.analysis` defines the vocabulary that records *how* a
+governance round was produced — the meta-agent's own trajectory. Every
+sub-agent appends `AnalysisStep` objects to a shared `AnalysisRecord`.
+
+### Building a record by hand
+
+```python
+from voyage_trace.analysis import (
+    AnalysisRecord, AnalysisStep, AnalysisStepKind, StepStatus,
+    OptimizationProposal, GovernancePlan,
+)
+from voyage_trace.simulator import Modification
+
+record = AnalysisRecord(target_agent_id="agent-A", round_id="r1")
+
+# Each sub-agent appends a step with a one-line chain-of-thought rationale.
+record.add_step(AnalysisStep(
+    kind=AnalysisStepKind.MODEL,
+    agent_role="modeling",
+    rationale="run AutoML target=cost_usd; enrich graph MD",
+    inputs={"trace_count": 5, "target": "cost_usd"},
+    outputs={"best_model": "total_tokens", "r_squared": 0.97},
+)).finish()
+
+# A candidate proposal (modification + rationale).
+record.add_proposal(OptimizationProposal(
+    modification=Modification(
+        target_node_id="chat:LLM", kind="swap_model",
+        params={"cost_multiplier": 0.3, "token_multiplier": 0.8},
+    ),
+    rationale="LLM is the cost hotspot",
+))
+
+record.finish()
+print(record.ok)  # False until a plan is attached
+```
+
+### JSON round-trip
+
+```python
+from voyage_trace.analysis import record_to_json, record_from_json
+
+text = record_to_json(record)
+record2 = record_from_json(text)
+assert record2.target_agent_id == record.target_agent_id
+assert len(record2.steps) == len(record.steps)
+```
+
+### Rendering the trajectory as Markdown
+
+```python
+from voyage_trace.analysis import render_analysis_markdown
+
+md = render_analysis_markdown(record)
+```
+
+This produces a Git-diffable document (YAML front-matter + `## Timeline` +
+`## Proposals` + `## Plan`) following the same `agentic.md` convention as
+the execution graph, so analysis trajectories render natively on GitHub
+next to the execution graphs they produced.
+
+### The step-kind vocabulary
+
+| `AnalysisStepKind` | When a sub-agent records it |
+|---|---|
+| `INGEST` | Adapted a raw payload into a `CanonicalTrace`. |
+| `MODEL` | Built an execution graph / ran AutoML. |
+| `SIMULATE` | Ran `replay()` / `simulate()` / `simulate_graph()`. |
+| `PROPOSE` | Emitted a candidate `Modification`. |
+| `VALIDATE` | Validated a proposal against the simulator. |
+| `DECIDE` | Accepted / rejected a proposal. |
+| `REMEMBER` | Persisted a finding/rule/template to memory. |
+| `RECALL` | Recalled a past finding/rule from memory. |
+
+---
+
+## 10. Multi-Agent Orchestrator
+
+`voyage_trace.agents` splits the governance pipeline into four sub-agents
+coordinated by one `Orchestrator`. This is the public entry point for
+"run one governance round end to end".
+
+### Running a full round
+
+```python
+import asyncio
+from voyage_trace.agents import Orchestrator
+
+async def main():
+    orch = Orchestrator()
+    record, plan = await orch.run(
+        payloads=[payload1, payload2, payload3],  # raw trace payloads
+        target_agent_id="agent-A",
+        round_id="r1",
+        automl_target="cost_usd",   # default
+        min_savings_usd=0.0,        # accept any validated saving
+    )
+    print(plan.summary)
+    print(plan.accepted_count)
+    print(plan.total_projected_savings_usd)
+    print(record.ok)
+
+asyncio.run(main())
+```
+
+### With Markdown output
+
+```python
+record, plan, md = await Orchestrator().run_with_markdown(
+    payloads=payloads,
+    target_agent_id="agent-A",
+    round_id="r1",
+)
+# md is the rendered AnalysisRecord trajectory (Git-diffable Markdown)
+```
+
+### Synchronous wrapper
+
+For scripts and tests that don't want to deal with asyncio directly:
+
+```python
+from voyage_trace.agents import run_sync
+
+record, plan = run_sync(
+    payloads=payloads,
+    target_agent_id="agent-A",
+    round_id="r1",
+)
+```
+
+### With partitioned memory
+
+Pass a `PartitionedMemory` to enable cross-round recall and outcome
+persistence. The governance agent recalls similar past outcomes before
+deciding, and remembers the round outcome after:
+
+```python
+from voyage_trace.agents import Orchestrator
+from voyage_trace.memory.manager import PartitionedMemory
+from voyage_trace.storage.in_memory import InMemoryStorage
+
+memory = PartitionedMemory(InMemoryStorage())
+await memory.mount("agent-A", "r1")
+
+record, plan = await Orchestrator().run(
+    payloads=payloads,
+    target_agent_id="agent-A",
+    round_id="r1",
+    memory=memory,
+)
+```
+
+### What each sub-agent does
+
+| Sub-agent | Role | Steps it records |
+|---|---|---|
+| `IngestAgent` | Adapts raw payloads into `CanonicalTrace`s. One `INGEST` step per payload (FAILED on error, continues with the rest); a summary step at the end. | `INGEST` |
+| `ModelingAgent` | Builds the execution graph (always); runs AutoML (≥3 traces only); turns each suggestion into a proposal. | `MODEL`, `PROPOSE` |
+| `SimulationAgent` | Validates each proposal via `simulate_graph` against an aggregated-graph baseline; fills `expected_savings`. | `SIMULATE`, `VALIDATE` |
+| `GovernanceAgent` | Accepts/rejects each proposal; builds the `GovernancePlan`; optionally recalls/remembers via memory. | `DECIDE`, `RECALL`, `REMEMBER` |
+
+The orchestrator threads a single `AnalysisRecord` through all four, so
+the full multi-agent trajectory is captured. When no traces are ingested,
+it short-circuits to an empty plan (but still records the trajectory
+honestly).
+
+### The "AutoML proposes, simulator disposes" contract
+
+No proposal reaches the governance plan unvalidated:
+
+1. `ModelingAgent` calls `run_automl()` and turns each
+   `suggested_modification` into an `OptimizationProposal` (unvalidated).
+2. `SimulationAgent` runs `simulate_graph(graph, [modification])` for each
+   proposal, fills `expected_savings` via `project_savings`, and marks
+   `validated=True` only if there are no divergences AND the cost delta is
+   non-negative.
+3. `GovernanceAgent` accepts a proposal only if it is validated AND
+   `cost_delta_usd >= min_savings_usd`.
+
+This keeps AutoML honest: it ranks associations and surfaces candidates,
+but the simulator — not AutoML — is the authority on whether a change
+actually helps.

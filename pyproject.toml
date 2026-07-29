@@ -33,6 +33,8 @@ dependencies = [
     "psycopg-pool>=3.2,<4",
     # Serialization
     "pyyaml>=6.0",
+    # AutoML — wrapped by voyage_trace.automl for trace-driven modelling
+    "autogluon.tabular>=1.0",
     # deepagents already pulls langchain / langgraph transitively.
 ]
 

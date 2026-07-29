@@ -145,6 +145,30 @@ class Modification:
     params: dict[str, Any] = field(default_factory=dict)
     note: str = ""
 
+    def to_dict(self) -> dict[str, Any]:
+        """Serialise this modification to a JSON-safe dict."""
+        return {
+            "target_node_id": self.target_node_id,
+            "kind": self.kind,
+            "params": self.params,
+            "note": self.note,
+        }
+
+
+def modification_to_dict(m: Modification) -> dict[str, Any]:
+    """Serialise a :class:`Modification` to a JSON-safe dict."""
+    return m.to_dict()
+
+
+def modification_from_dict(d: dict[str, Any]) -> Modification:
+    """Deserialise a dict back into a :class:`Modification`."""
+    return Modification(
+        target_node_id=d.get("target_node_id", ""),
+        kind=d.get("kind", "swap_model"),
+        params=d.get("params") or {},
+        note=d.get("note", ""),
+    )
+
 
 @dataclass
 class _WalkState:

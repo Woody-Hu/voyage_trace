@@ -211,6 +211,171 @@ A side-effect-free, pure-Python engine that wraps an `ExecutionGraph` (or a
   modified `SimulationResult` (`cost_delta_usd`, `tokens_delta`,
   `duration_delta_s`, `cost_reduction_pct`). Positive numbers = reduction.
 
+### `analysis.py` — Internal data format for the analysis trajectory
+
+While the rest of voyage_trace models the *target* agent (the agent being
+observed), nothing described the *meta-agent's own* process — the steps it
+took to go from raw payloads → findings → proposals → validated plan.
+`analysis.py` fills that gap with a small, dependency-free,
+JSON-serialisable vocabulary that records **how** a governance round was
+produced. Every sub-agent in the multi-agent pipeline appends
+`AnalysisStep` objects to a shared `AnalysisRecord`, so the analysis
+trajectory is itself a first-class, diffable artefact — exactly mirroring
+how the execution graph makes the target agent's trajectory a first-class
+artefact.
+
+| Type | Kind | Purpose |
+|---|---|---|
+| `AnalysisStepKind` | `str, Enum` | What kind of step: `INGEST`, `MODEL`, `SIMULATE`, `PROPOSE`, `VALIDATE`, `DECIDE`, `REMEMBER`, `RECALL`. Mirrors the pipeline stages so a record can be filtered by stage without parsing free text. |
+| `StepStatus` | `str, Enum` | Outcome of one step: `SUCCESS`, `FAILED`, `SKIPPED`. |
+| `ProposalDecision` | `str, Enum` | Governance decision: `ACCEPTED`, `REJECTED`, `DEFERRED`. |
+| `AnalysisStep` | `@dataclass` | One step of the meta-agent's trajectory: `kind`, `agent_role`, `rationale` (one-line CoT), `inputs`/`outputs` summaries, `artifacts` (`{namespace: key}` pointers into storage), `status`, `note`. `finish(status, note)` stamps `ended_at`. |
+| `OptimizationProposal` | `@dataclass` | A candidate optimisation: wraps a `Modification` with `rationale`, `expected_savings` (filled by the simulator), `validated` flag, and a `decision`. `accept()`/`reject()` stamp the decision. |
+| `GovernancePlan` | `@dataclass` | Final output of one round: accepted/rejected proposal lists, a human-readable `summary`, `metrics`, and `analysis_record_id` back-reference. `total_projected_savings_usd` sums accepted savings. |
+| `AnalysisRecord` | `@dataclass` | The complete ordered trajectory of one round: `steps`, `proposals`, `plan`. Threaded through every sub-agent. `ok` is True iff no step failed and a plan was produced. |
+
+**JSON serialisation** — round-trippable, mirrors `protocol.py`'s style:
+`step_to_dict`/`step_from_dict`, `proposal_to_dict`/`proposal_from_dict`,
+`plan_to_dict`/`plan_from_dict`, `record_to_dict`/`record_from_dict`,
+`record_to_json`/`record_from_json`.
+
+**Markdown rendering** — `render_analysis_markdown(record)` produces a
+Git-diffable document following the same `agentic.md` convention (YAML
+front-matter + `##` sections) as the execution graph:
+
+```markdown
+---
+record_id: rec-...
+target_agent_id: agent-A
+round_id: r1
+step_count: 12
+ok: true
+---
+# Governance Round r1 — Analysis Trajectory
+
+## Summary
+<plan summary, or "In-progress record with N step(s)...">
+
+## Timeline
+| # | step | agent | kind | status | dur(s) | rationale |
+
+## Proposals
+| id | target | kind | validated | decision | saving($) | rationale |
+
+## Plan
+- plan_id: plan-...
+- accepted: 2
+- total_projected_savings_usd: 0.420000
+```
+
+The record persists under the `analysis_records` storage namespace; the
+rendered Markdown renders natively on GitHub next to the execution graphs
+it produced.
+
+### `automl.py` — AutoML as a tool for trace-driven modelling
+
+AutoML is exposed as a *tool* the modelling sub-agent calls to turn a
+collection of `CanonicalTrace` objects into a learned model of "what drives
+an outcome". It is deliberately **dependency-free** (pure-Python statistics
+— no numpy / scikit-learn) so it runs anywhere voyage_trace runs and its
+behaviour is fully auditable.
+
+**How AutoML matches the Markdown-based modelling approach.** The execution
+graph's `## Nodes` table (calls, p50, p99, tokens, cost, err%) IS the
+AutoML feature matrix — two views of the same numbers. AutoML treats that
+table as a feature matrix and learns which columns drive a target outcome.
+The two views compose into one loop:
+
+```
+ExecutionGraph (MD)  ──►  AutoML feature matrix  ──►  learned model
+        ▲                                                    │
+        │                                                    ▼
+MD graph enriched          ◄──  suggested Modifications  ◄───┘
+(## Learned Signals,             (validated by simulator)
+ ## Proposed Modifications)
+```
+
+* `## Learned Signals` — feature importances spliced back into the same MD
+  document so a human reviewer sees descriptive and explanatory stats side
+  by side.
+* `## Suggested Modifications` — concrete `Modification` objects derived
+  from the learned importances, each to be validated by `simulate()` before
+  acceptance. **AutoML proposes; the simulator disposes.**
+
+| Type / Function | Role |
+|---|---|
+| `FEATURE_NAMES` | The canonical per-node feature set: `calls`, `p50_duration`, `p99_duration`, `total_tokens`, `error_rate` — exactly the MD `## Nodes` columns. |
+| `TARGETS` | Supported regression targets: `cost_usd`, `total_tokens`, `total_duration_s`. |
+| `FeatureMatrix` | One row per aggregated graph node; `column(name)` returns a feature or target column. |
+| `extract_feature_matrix(traces)` | Aggregates traces into one template graph, then builds a `FeatureMatrix` (same data as the MD `## Nodes` table). |
+| `feature_matrix_from_graph(graph)` | Builds a `FeatureMatrix` from a pre-aggregated graph. |
+| `TrainedModel` | One fitted model: a univariate linear regression on a single feature, or a constant mean baseline (`feature == "(mean)"`). Carries `slope`, `intercept`, `r_squared`, `rmse`. |
+| `AutoMLReport` | Full output of `run_automl`: `best_model`, `all_models`, `feature_importances`, `top_cost_nodes`, `high_error_nodes`, `suggested_modifications`, `notes`. `to_dict()` is JSON-safe. |
+| `run_automl(traces=None, *, graph=None, target, ...)` | The entry point. Pipeline: build matrix → fit mean baseline + one univariate model per feature → auto-select best by R² → rank features by `|Pearson r|` (normalised to sum 1) → surface top-cost/high-error nodes as candidate `Modification`s. |
+| `render_automl_markdown(report)` | Renders `## Learned Signals` / `## Models` / `## Suggested Modifications` sections. |
+| `inject_automl_into_graph_md(graph_md, report)` | Splices those sections into an execution-graph MD doc, before `## Bottlenecks` (or appends). Closes the MD ↔ AutoML loop. |
+| `AUTOML_COT_PROMPT` | Chain-of-thought prompt seeding the modelling sub-agent: when to call AutoML (≥3 traces), how to call it, how it relates to the MD graph, what to do with the output, and the honesty contract (never present correlation as causation; echo low-sample warnings). |
+
+**Candidate modification logic** (conservative by design):
+* A high-error node (`error_rate > error_threshold`, default 0.5) →
+  `cap_loops` (limit visits to 1, mirroring a `max_loops` guardrail).
+  Processed **before** cost hotspots so a node that is both failing AND
+  expensive gets the guardrail, not a cheaper-model swap.
+* A cost hotspot (`cost > cost_threshold`, default $0.01) → `swap_model`
+  (0.3× cost, 0.8× tokens).
+
+**Honesty contract.** When no feature beats the mean baseline (R² ≤ 0),
+the report explicitly says so and recommends collecting more traces. When
+fewer than `min_samples` (default 3) traces were observed, a low-sample
+warning is appended to `notes` — the count is based on `observed_runs`
+(traces), not node count.
+
+### `agents.py` — Multi-agent architecture
+
+Splits the analysis / optimisation process into four specialised
+sub-agents coordinated by one orchestrator:
+
+```
+┌──────────────┐   payloads   ┌──────────────┐  traces  ┌──────────────┐
+│ IngestAgent  │ ───────────► │ ModelingAgent│ ───────► │SimulationAgent│
+│              │   traces     │ (+ AutoML)   │  graph   │              │
+└──────────────┘              └──────────────┘  props   └──────┬───────┘
+                                                                   │ validated
+                                                                   ▼
+                                                       ┌──────────────────┐
+                                                       │ GovernanceAgent  │
+                                                       │  (decide+memory) │
+                                                       └──────────────────┘
+```
+
+Every sub-agent operates on a shared `AnalysisRecord` and appends
+`AnalysisStep` objects. So the multi-agent trajectory *is* the
+`AnalysisRecord`.
+
+**Design notes:**
+* **Pure-Python, no live LLM.** Each agent is a plain class with a `run`
+  method. The role CoT prompts (`*_ROLE`) are the same prompts a
+  `deepagents` sub-agent would be seeded with — wiring them into real LLM
+  sub-agents is a mechanical step (pass `role.cot_prompt` as the system
+  prompt and expose `run`'s body as tools).
+* **Sync core, async seam.** Ingest / Modelling / Simulation are pure CPU
+  work and stay sync. Governance is `async` because it touches the async
+  `PartitionedMemory`. The `Orchestrator` is `async` to match.
+* **AutoML proposes, simulator disposes.** No proposal reaches the plan
+  unvalidated.
+
+| Type | Role |
+|---|---|
+| `AgentRole` | Declarative description of one sub-agent: `name`, `description`, `cot_prompt`, `inputs`, `outputs`. The CoT prompt doubles as documentation for the sync `run` method. |
+| `INGEST_ROLE` / `MODELING_ROLE` / `SIMULATION_ROLE` / `GOVERNANCE_ROLE` | The four role definitions. `MODELING_ROLE.cot_prompt` is `AUTOML_COT_PROMPT`. |
+| `ModelingOutput` | What the modelling agent hands to the simulation agent: `graph`, `graph_md` (AutoML-enriched), `report`, `automl_target`. |
+| `IngestAgent` | Adapts raw payloads into `CanonicalTrace`s. One `INGEST` step per payload (FAILED on error, continues with the rest); a summary step at the end (FAILED if no traces produced). |
+| `ModelingAgent` | Builds the execution graph (always); runs AutoML (≥3 traces only); turns each suggestion into an `OptimizationProposal` + `PROPOSE` step. With <3 traces it records an "insufficient samples" step and produces the descriptive graph only. |
+| `SimulationAgent` | Validates each proposal via `simulate_graph` against an aggregated-graph baseline (proposals target aggregated node_ids). Fills `expected_savings` via `project_savings`; marks `validated=True` iff no divergences AND cost delta ≥ 0. One `VALIDATE` step per proposal. |
+| `GovernanceAgent` | `async`. Accepts a proposal iff validated AND `cost_delta_usd >= min_savings_usd`. Builds the `GovernancePlan`, composes a summary (surfaces AutoML's top feature + low-sample warnings), finishes the record. Optionally recalls/remembers via `PartitionedMemory` (`RECALL`/`REMEMBER` steps). |
+| `Orchestrator` | `async`. Public entry point for one governance round. Owns the `AnalysisRecord`, hands it to each sub-agent in turn. `run()` returns `(record, plan)`; `run_with_markdown()` also returns the rendered trajectory MD. Short-circuits to an empty plan when no traces are ingested. |
+| `run_sync(**kwargs)` | Synchronous wrapper around `Orchestrator().run()` for scripts/tests. |
+
 ### `storage/` — Workspace storage
 
 The single seam between voyage_trace and its persistence layer. Async-first
@@ -311,11 +476,22 @@ Stage-by-stage:
      token budgets; `project_savings` compares a baseline to a modified run.
    * `PartitionedMemory` and its partitions persist findings, rules,
      templates and scratch state scoped by `(target_agent_id, round_id)`.
-5. **Persist** — every artefact (traces, execution graphs, governance plans,
-   memory records, raw payloads) lands in one `WorkspaceStorage` backend.
-   `StorageBackedBackend` exposes that same backend to the `deepagents`
-   agent's file tools, so the agent's file view and voyage_trace's
-   structured view are fully consistent.
+5. **Govern (multi-agent orchestration)** — the
+   `agents.Orchestrator` runs one governance round end to end, threading a
+   single `AnalysisRecord` through four sub-agents:
+   * `IngestAgent` → `ModelingAgent` (builds graph + AutoML) →
+     `SimulationAgent` (validates proposals) → `GovernanceAgent` (decides +
+     memory). Each appends `AnalysisStep`s to the shared record, so the
+     analysis trajectory is itself a first-class, diffable artefact.
+   * AutoML enriches the execution-graph MD with `## Learned Signals` /
+     `## Suggested Modifications`; the simulator validates each suggestion
+     before the governance agent accepts it (**AutoML proposes, simulator
+     disposes**).
+6. **Persist** — every artefact (traces, execution graphs, governance plans,
+   analysis records, memory records, raw payloads) lands in one
+   `WorkspaceStorage` backend. `StorageBackedBackend` exposes that same
+   backend to the `deepagents` agent's file tools, so the agent's file view
+   and voyage_trace's structured view are fully consistent.
 
 ## 4. Design Principles
 
@@ -346,6 +522,23 @@ Stage-by-stage:
   target agent, never share a namespace. Cross-round / cross-agent recall is
   an explicit opt-in via wildcard scopes (`round_id="*"`,
   `target_agent_id="*"`).
+* **The analysis trajectory is a first-class artefact.** Just as the
+  execution graph makes the *target* agent's behaviour diffable, the
+  `AnalysisRecord` makes the *meta-agent's* behaviour diffable. Every
+  sub-agent appends `AnalysisStep`s (with a one-line CoT `rationale`) to a
+  shared record, which round-trips through JSON and renders to the same
+  `agentic.md` convention. Nothing about *how* a governance plan was
+  produced is implicit.
+* **AutoML proposes, the simulator disposes.** AutoML is a *tool* the
+  modelling sub-agent calls — never an authority. It ranks feature
+  associations (`|Pearson r|`) and surfaces candidate `Modification`s, but
+  no candidate reaches the plan until the simulator validates it with
+  `project_savings`. Correlation is never presented as causation.
+* **Dependency-free AutoML.** `automl.py` is pure-Python statistics (no
+  numpy / scikit-learn), so its behaviour is fully auditable and it runs
+  anywhere voyage_trace runs. Its feature matrix is exactly the execution
+  graph's `## Nodes` table — the MD graph and AutoML are two views of the
+  same numbers.
 
 ## 5. Storage Namespace Convention
 
@@ -357,6 +550,7 @@ a logical bucket. By convention:
 | `traces` | Normalised `CanonicalTrace` JSON documents, one per observed agent run. |
 | `execution_graphs` | Rendered execution-graph Markdown documents (the canonical on-disk representation of an agent's shape). |
 | `governance_plans` | Governance / optimisation plans produced by the meta-agent. |
+| `analysis_records` | `AnalysisRecord` JSON (and rendered Markdown) — the full step-by-step trajectory of how each governance round was produced. |
 | `memory/<target_agent_id>/<partition>/<round_id>` | Partitioned memory records. `<partition>` is one of `episodic`, `semantic`, `procedural`, `working`. The `(target_agent_id, round_id)` pair is the unit of isolation. |
 | `raw` | Raw, pre-adaptation payloads kept for audit / re-adaptation. |
 

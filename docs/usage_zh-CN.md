@@ -1,8 +1,8 @@
 # voyage_trace —— 使用指南
 
 `voyage_trace` 是一个元智能体（meta-agent），用于采集其他智能体的执行轨迹并生成
-治理与优化方案。本指南涵盖公开 API：适配器、执行图、模拟器、存储后端、分区内存
-以及 JSON 序列化。
+治理与优化方案。本指南涵盖公开 API：适配器、执行图、模拟器、存储后端、分区内存、
+JSON 序列化、多智能体编排器以及闭环校验。
 
 ## 目录
 
@@ -13,6 +13,8 @@
 5. [存储后端](#5-存储后端)
 6. [分区内存](#6-分区内存)
 7. [JSON 序列化](#7-json-序列化)
+8. [多智能体编排器](#8-多智能体编排器)
+9. [闭环校验](#9-闭环校验)
 
 ---
 
@@ -427,3 +429,214 @@ trace3 = trace_from_dict(d)
 `trace_to_json` 产出键排序后的紧凑 JSON。`trace_from_json` 接受 `str` 或
 `bytes`。反序列化时未知键会被忽略，缺失的可选键回退到默认值，因此旧版本序列化
 的轨迹仍然可以加载。
+
+---
+
+## 8. 多智能体编排器
+
+`voyage_trace.agents` 把治理管线拆分为四个由一个 `Orchestrator` 协调的子智能体，
+外加第五个校验子智能体在方案部署后闭合投影→实际环。这是“端到端运行一轮治理”的
+公开入口。
+
+### 运行完整一轮
+
+```python
+import asyncio
+from voyage_trace.agents import Orchestrator
+
+async def main():
+    orch = Orchestrator()
+    record, plan = await orch.run(
+        payloads=[payload1, payload2, payload3],  # 原始 trace payload
+        target_agent_id="agent-A",
+        round_id="r1",
+        automl_target="cost_usd",   # 默认
+        min_savings_usd=0.0,        # 接受任何校验通过的节省
+    )
+    print(plan.summary)
+    print(plan.accepted_count)
+    print(plan.total_projected_savings_usd)
+    print(record.ok)
+
+asyncio.run(main())
+```
+
+### 带 Markdown 输出
+
+```python
+record, plan, md = await Orchestrator().run_with_markdown(
+    payloads=payloads,
+    target_agent_id="agent-A",
+    round_id="r1",
+)
+# md 是渲染后的 AnalysisRecord 轨迹（可 Git diff 的 Markdown）
+```
+
+### 同步包装
+
+供不想直接处理 asyncio 的脚本与测试使用：
+
+```python
+from voyage_trace.agents import run_sync
+
+record, plan = run_sync(
+    payloads=payloads,
+    target_agent_id="agent-A",
+    round_id="r1",
+)
+```
+
+### 带分区内存
+
+传入 `PartitionedMemory` 以启用跨轮次召回与结果持久化。治理智能体在决策前召回
+相似的过往结果，在决策后记忆本轮结果：
+
+```python
+from voyage_trace.agents import Orchestrator
+from voyage_trace.memory.manager import PartitionedMemory
+from voyage_trace.storage.in_memory import InMemoryStorage
+
+memory = PartitionedMemory(InMemoryStorage())
+await memory.mount("agent-A", "r1")
+
+record, plan = await Orchestrator().run(
+    payloads=payloads,
+    target_agent_id="agent-A",
+    round_id="r1",
+    memory=memory,
+)
+```
+
+### 每个子智能体做什么
+
+| 子智能体 | 角色 | 记录的步骤 |
+|---|---|---|
+| `IngestAgent` | 把原始 payload 适配为 `CanonicalTrace`。每条 payload 一个 `INGEST` 步骤（出错 FAILED，继续处理其余）；末尾一个汇总步骤。 | `INGEST` |
+| `ModelingAgent` | 构建执行图（始终）；运行 AutoML（仅 ≥3 条 trace）；把每条建议转为方案。 | `MODEL`、`PROPOSE` |
+| `SimulationAgent` | 通过 `simulate_graph` 对聚合图基线校验每个方案；填 `expected_savings`。 | `SIMULATE`、`VALIDATE` |
+| `GovernanceAgent` | 接受/拒绝每个方案（当召回 `τ` 时基于*校准后*投影）；构建 `GovernancePlan`；可选地通过记忆召回/记忆。 | `DECIDE`、`RECALL`、`REMEMBER` |
+| `VerificationAgent` | 部署后，校验方案的投影节省 vs 部署后实际节省；在语义记忆中更新校准 `τ`。 | `VERIFY`、`RECALL`、`REMEMBER` |
+
+编排器把单个 `AnalysisRecord` 贯穿前四个子智能体，因此完整的多智能体轨迹被捕获。
+当无 trace 采集时，它短路为空方案（但仍诚实记录轨迹）。当 `memory` 接入时，`run()`
+还会召回按智能体的 `τ`（由先前 `verify_round` 写入）使治理决策校准；见
+[§9 闭环校验](#9-闭环校验)。
+
+### “AutoML 提议，仿真器定夺”契约
+
+无方案在未校验时进入治理方案：
+
+1. `ModelingAgent` 调用 `run_automl()` 并把每个 `suggested_modification` 转为一个
+   `OptimizationProposal`（未校验）。
+2. `SimulationAgent` 为每个方案运行 `simulate_graph(graph, [modification])`，通过
+   `project_savings` 填 `expected_savings`，仅当无分歧且成本差非负时标记
+   `validated=True`。
+3. `GovernanceAgent` 仅当方案校验通过且
+   `calibrated_projection(cost_delta_usd, τ) >= min_savings_usd` 时接受 —— 当校准
+   `τ` 已从先前校验轮次召回时，阈值应用于 `τ · projected` 而非原始投影。
+
+这保持 AutoML 诚实：它排序关联并浮现候选，但仿真器 —— 而非 AutoML —— 是“变更是否
+真有帮助”的权威。[§9](#9-闭环校验) 中的闭环进而保持*仿真器*诚实：其投影被与现实
+比较并由 `τ` 校正。
+
+---
+
+## 9. 闭环校验
+
+仿真器的投影节省是一次*预测*，而非*测量*。`voyage_trace.verification` 闭合该环：
+在方案部署后，部署后 trace 被重新采集，每个接受方案的投影与实际兑现的节省配对，
+差距折入按智能体的校准乘子 `τ = Σactual / Σprojected`，下一轮治理把它应用于其原始
+投影。当 `τ = None`（冷启动）时治理行为与之前完全一致 —— 闭环是严格加性的。
+
+这是 OPTIMAS（arXiv:2507.03041）的 **Local Reward Function** 模式在 voyage_trace 中
+的适配：一个每次迭代重新对齐的学习到的 local→global 映射。这里“local”是仿真器投影，
+“global”是观测节省，“LRF”是单一标量 `τ`。
+
+### 校验一个已部署的方案
+
+`verify_plan` 做**真实图算术** —— 它在 before-graph 与 after-graph 之间按节点相减
+`cost_usd`，绝不查阅仿真器的投影。`Orchestrator.verify_round` 是端到端入口：它通过
+真实的 `IngestAgent` 采集部署后 payload，构建 after-graph，校验并更新 `τ`。
+
+```python
+import asyncio
+from voyage_trace.agents import Orchestrator
+from voyage_trace.memory import PartitionedMemory
+from voyage_trace.storage import InMemoryStorage
+from voyage_trace.execution_graph import aggregate_execution_graph
+
+memory = PartitionedMemory(InMemoryStorage())
+orch = Orchestrator()
+
+# --- 第 1 轮：治理（冷启动 τ）--- #
+record1, plan1 = await orch.run(
+    payloads=before_payloads,
+    target_agent_id="agent-A",
+    round_id="r1",
+    memory=memory,
+)
+before_graph = aggregate_execution_graph(...)  # plan1 所基于的图
+
+# ... 运营者部署 plan1，agent-A 在生产环境运行，trace 被采集 ...
+
+# --- 校验：测量实际节省，更新 τ --- #
+ver_record, ver_result, calib = await orch.verify_round(
+    plan=plan1,
+    before_graph=before_graph,
+    after_payloads=post_deployment_payloads,
+    memory=memory,
+    round_id="verify-r1",
+)
+print(ver_result.total_projected_usd)  # 仿真器承诺的
+print(ver_result.total_actual_usd)     # 实际兑现的
+print(ver_result.total_error_usd)      # 投影 - 实际（正 = 乐观）
+print(calib.tau)                       # Σactual / Σprojected（冷启动时为 None）
+
+# --- 第 2 轮：治理在*校准后*投影上定夺 --- #
+record2, plan2 = await orch.run(
+    payloads=before_payloads_2,
+    target_agent_id="agent-A",
+    round_id="r2",
+    memory=memory,  # τ 被自动召回；无需显式传入
+)
+```
+
+### `verify_plan` 产出什么
+
+| 字段 | 含义 |
+|---|---|
+| `projection_errors` | 每个接受方案一个 `ProjectionError`，把其 `projected_usd` 与其 `target_node_id` 的 `actual_usd` 配对。当目标在 after-graph 中无法匹配时 `actual_usd` 为 `None` —— 此方案 `unverifiable` 并被排除在 `τ` 之外。 |
+| `comparison_mode` | before/after `observed_runs` 相同时为 `"totals"`；不同时为 `"per_call_projected"`（按调用节省重新投影到 before 体量）。 |
+| `total_projected_usd` / `total_actual_usd` | 仅对可校验方案求和。 |
+| `total_error_usd` | `projected - actual`（正 = 乐观仿真器）。 |
+| `mean_relative_error` | 可校验方案上 `error / projected` 的均值。 |
+
+### 校准乘子 `τ`
+
+`CalibrationState` 是按智能体的运行中校准 —— `τ` 是累积的（覆盖该智能体曾观测到的
+每个观测，`Σactual / Σprojected`），而非滑动窗口，且在第一个投影节省非零的观测之前
+为 `None`。`calibrated_projection(raw, τ)` 应用它；冷启动（`τ is None`）原样返回原始值。
+
+```python
+from voyage_trace.verification import calibrated_projection
+
+calibrated_projection(1.96, None)    # 1.96 —— 冷启动，原始投影
+calibrated_projection(1.96, 0.5)     # 0.98 —— 乐观仿真器，打折
+calibrated_projection(1.96, 1.5)     # 2.94 —— 悲观仿真器，放大
+```
+
+`τ < 1` 表示仿真器乐观（投影多于兑现）且治理应打折；`τ > 1` 悲观；`τ ≈ 1` 已校准。
+`VerificationAgent` 从语义记忆召回状态（在固定伪轮次 `_calibration`、键
+`calibration_state` 下），折入新结果，并持久化回去 —— 因此 `τ` 跨校验轮次累积，
+并被下一轮治理召回。
+
+### 诚实契约
+
+- `compare_graphs` 做真实图算术，**绝不**读取仿真器的投影 —— 这正是闭环的意义。
+- 目标节点在 after-graph 中缺失的方案被报告为 `unverifiable`，绝不静默丢弃或归零。
+  不可校验的方案不贡献给 `τ`。
+- `τ` 直到存在一个真实的 `(projected, actual)` 对之前为 `None`（而非 `1.0`）。
+  此时治理回退到原始投影 —— 冷启动路径是显式的，系统退化为开环行为。
+- 每个方案上的原始 `expected_savings` 绝不被覆盖。`τ` 记录在
+  `proposal.calibration_applied` 与 `plan.calibration_applied` 上，因此原始 vs 校准
+  的决策始终可审计。

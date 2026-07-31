@@ -193,6 +193,214 @@ trace = adapt(raw_payload, source_protocol="langsmith")  # 或 None 自动推断
   差值（`cost_delta_usd`、`tokens_delta`、`duration_delta_s`、
   `cost_reduction_pct`）。正数 = 减少。
 
+### `analysis.py` —— 分析轨迹的内部数据格式
+
+voyage_trace 其余部分建模的是*目标*智能体（被观察的智能体），但没有任何东西描述
+*元智能体自身*的过程 —— 它从原始 payload → 发现 → 方案 → 校验过的方案走了哪些
+步骤。`analysis.py` 用一个轻量、零依赖、可 JSON 序列化的词汇表填补了这个空白，记录
+一次治理轮次是**如何**产出的。多智能体管线中的每个子智能体都向共享的
+`AnalysisRecord` 追加 `AnalysisStep` 对象，因此分析轨迹本身就是一个一等、可 diff 的
+产物 —— 正如执行图让目标智能体的轨迹成为一等产物一样。
+
+| 类型 | 种类 | 用途 |
+|---|---|---|
+| `AnalysisStepKind` | `str, Enum` | 步骤种类：`INGEST`、`MODEL`、`SIMULATE`、`PROPOSE`、`VALIDATE`、`DECIDE`、`REMEMBER`、`RECALL`、`VERIFY`。镜像管线阶段，使记录可按阶段过滤而无需解析自由文本。`VERIFY` 由校验子智能体在方案部署后追加。 |
+| `StepStatus` | `str, Enum` | 单步结果：`SUCCESS`、`FAILED`、`SKIPPED`。 |
+| `ProposalDecision` | `str, Enum` | 治理决策：`ACCEPTED`、`REJECTED`、`DEFERRED`。 |
+| `AnalysisStep` | `@dataclass` | 元智能体轨迹的一步：`kind`、`agent_role`、`rationale`（一行 CoT）、`inputs`/`outputs` 摘要、`artifacts`（指向存储的 `{namespace: key}` 指针）、`status`、`note`。`finish(status, note)` 盖上 `ended_at`。 |
+| `OptimizationProposal` | `@dataclass` | 一个候选优化：用一个 `Modification` 包装 `rationale`、`expected_savings`（仿真器的*原始*投影）、`validated` 标志与一个 `decision`。`accept()`/`reject()` 盖上决策。闭环字段：`actual_savings`（观测到的节省，由校验智能体填写）、`verified` 标志、`calibration_applied`（治理使用的乘子 `τ`，`None` = 冷启动）。 |
+| `GovernancePlan` | `@dataclass` | 一轮的最终输出：接受/拒绝的方案列表、人类可读的 `summary`、`metrics`、`analysis_record_id` 回引。`total_projected_savings_usd` 汇总仿真器的原始投影；`total_actual_savings_usd` 汇总*已校验*接受方案上的观测节省（在校验轮次运行前保持 0.0）。`calibration_applied` 与 `verification_id` 使闭环在方案层面可见。 |
+| `AnalysisRecord` | `@dataclass` | 一轮完整的有序轨迹：`steps`、`proposals`、`plan`。贯穿每个子智能体。`ok` 为 True 当且仅当无步骤失败且产出了方案。 |
+
+**JSON 序列化** —— 可往返，镜像 `protocol.py` 的风格：
+`step_to_dict`/`step_from_dict`、`proposal_to_dict`/`proposal_from_dict`、
+`plan_to_dict`/`plan_from_dict`、`record_to_dict`/`record_from_dict`、
+`record_to_json`/`record_from_json`。
+
+**Markdown 渲染** —— `render_analysis_markdown(record)` 产出可 Git diff 的文档，
+遵循与执行图相同的 `agentic.md` 约定（YAML 前置元数据 + `##` 小节）：
+
+```markdown
+---
+record_id: rec-...
+target_agent_id: agent-A
+round_id: r1
+step_count: 12
+ok: true
+---
+# Governance Round r1 — Analysis Trajectory
+
+## Summary
+<方案摘要，或 "In-progress record with N step(s)...">
+
+## Timeline
+| # | step | agent | kind | status | dur(s) | rationale |
+
+## Proposals
+| id | target | kind | validated | decision | saving($) | rationale |
+
+## Plan
+- plan_id: plan-...
+- accepted: 2
+- total_projected_savings_usd: 0.420000
+```
+
+记录持久化在 `analysis_records` 存储命名空间下；渲染后的 Markdown 在 GitHub 上与
+它产出的执行图并排原生渲染。
+
+### `automl.py` —— 把 AutoML 作为 trace 驱动建模的工具
+
+AutoML 被暴露为建模子智能体调用的一个*工具*，把一组 `CanonicalTrace` 对象转化为
+一个学习到的“什么驱动了某个结果”的模型。它刻意**零依赖**（纯 Python 统计 —— 不依赖
+numpy / scikit-learn），因此可在 voyage_trace 运行的任何地方运行，行为完全可审计。
+它包装 [AutoGluon](https://auto.gluon.ai/stable/index.html) TabularPredictor 做模型
+选择、超参调优与集成。AutoGluon 在 `run_automl()` 内部惰性导入，使模块的常量、数据类
+与渲染函数在未安装它时仍可导入。
+
+**AutoML 如何匹配基于 Markdown 的建模方式。** 执行图的 `## Nodes` 表
+（calls、p50、p99、tokens、cost、err%）就是 AutoML 的特征矩阵 —— 同一组数字的两个
+视图。AutoML 把该表当作特征矩阵，学习哪些列驱动某个目标结果。两个视图组合成一个循环：
+
+```
+ExecutionGraph (MD)  ──►  AutoML 特征矩阵  ──►  学习到的模型
+        ▲                                                    │
+        │                                                    ▼
+MD 图被富化            ◄──  建议的 Modifications  ◄───────────┘
+(## Learned Signals,        (由仿真器校验)
+ ## Proposed Modifications)
+```
+
+* `## Learned Signals` —— 特征重要性回切进同一份 MD 文档，使人类审阅者同时看到
+  描述性与解释性统计。
+* `## Suggested Modifications` —— 从学习到的重要性派生的具体 `Modification` 对象，
+  每个在接纳前由 `simulate()` 校验。**AutoML 提议，仿真器定夺。**
+
+**候选修改逻辑**（保守设计）：
+* 高错误率节点（`error_rate > error_threshold`，默认 0.5）→ `cap_loops`（限制访问
+  次数为 1，镜像 `max_loops` 护栏）。在成本热点**之前**处理，使一个既失败又昂贵的
+  节点得到护栏而非更便宜模型的替换。
+* 成本热点（`cost > cost_threshold`，默认 $0.01）→ `swap_model`（0.3× 成本，
+  0.8× token）。
+
+**诚实契约。** 当所有置换重要性为零（无特征能在均值基线之上解释方差）时，报告会
+明确说明并建议采集更多 trace。当观测到的 trace 少于 `min_samples`（默认 3）时，
+`notes` 会追加低样本警告 —— 计数基于 `observed_runs`（trace 数）而非节点数。
+
+### `verification.py` —— 投影 vs 实际节省的闭环校验
+
+voyage_trace 其余部分是一个**开环**：仿真器*投影*一个 `Modification` 能节省多少，
+治理智能体接受投影节省超过阈值的方案，然后方案被发出 —— 但从未有人校验投影的节省
+在方案部署后是否真正*兑现*。因此每个被接受的方案都是一次预测，却没有预测误差的度量，
+也没有机制去纠正预测器的系统性偏差。
+
+本模块闭合该环。它是 OPTIMAS（Wu et al., ICLR 2026, arXiv:2507.03041）的
+**Local Reward Function (LRF)** 模式在 voyage_trace 中的适配：一个学习到的、
+按组件的 local→global 映射，随系统漂移每次迭代重新对齐。这里“local 信号”是仿真器
+的投影节省，“global 结果”是通过重新采集部署后 trace 观测到的实际节省，“LRF”是每个
+目标智能体的一个标量校准乘子 `τ = Σactual / Σprojected`。三份已发表证据支撑此设计：
+
+* **聚合投影会误导。** Counterfactual Trace Auditing（arXiv:2605.11946）发现聚合
+  ΔP ≈ 0，而底层智能体行为改变了 696 次 —— 投影节省总量是真实影响的不可靠信号。
+* **未校验的方案系统性高估。** TextualVerifier（arXiv:2511.03739）表明给文本梯度方案
+  增加一个校验步骤能在留出指标上恢复 +2 到 +10pp。
+* **学习到的 local→global 映射胜过原始判断。** OPTIMAS 报告 LRF 排序准确率 77.96%
+  vs LLM judge 的 49.52%，并每次迭代重新拟合 LRF 以追踪漂移。
+
+闭合是通过 `τ` 的反馈路径：
+
+```
+    round N                     round N+1（部署后）
+┌──────────────┐               ┌────────────────────────┐
+│ AutoML       │               │ 采集 after-traces      │
+│ simulator    │               │ 构建 after-graph       │
+│  projected P │               │   actual A             │
+│  governance  │ ◄─────────────┤   verify_plan(P, A)    │
+│  accepts on P│               │   update_calibration τ │
+└──────┬───────┘               └────────────────────────┘
+       │                                  │
+       ▼                                  ▼
+下一轮 governance              τ = ΣA / ΣP（每个目标智能体）
+在 τ · projected 上定夺        持久化在语义记忆中，跨轮次召回
+```
+
+当 `τ = None`（冷启动，无校验历史）时系统行为与之前完全一致 ——
+`calibrated_projection` 原样返回原始投影。随着部署后 trace 累积，`τ` 收敛到真实的
+投影器偏差，治理决策变得校准。这是严格加性的反馈路径：它从不移除仿真器，从不伪造节省，
+从不修改已记录的 trace。
+
+| 类型 / 函数 | 角色 |
+|---|---|
+| `ProjectionError` | 一个方案的投影与实际节省之间的差距。当目标节点在 after-graph 中无法匹配时 `actual_usd` 为 `None` —— 此类方案 `unverifiable` 并被排除在 `τ` 之外。`error_usd`（正 = 乐观）与 `relative_error` 为派生属性。 |
+| `VerificationResult` | 校验一个 `GovernancePlan` 与现实的结果。携带 `projection_errors`、按节点的 `node_actual_savings`、`comparison_mode`（before/after `observed_runs` 相同时为 `"totals"`，否则 `"per_call_projected"`）以及聚合总量（`total_projected_usd`、`total_actual_usd`、`total_error_usd`、`mean_relative_error`）。 |
+| `CalibrationState` | 一个智能体仿真器投影器的运行中校准：`τ = sum_actual / sum_projected`，覆盖该智能体曾观测到的每个 `(projected, actual)` 对。直到存在一个投影节省非零的观测之前 `tau` 为 `None`（冷启动）。累积而非滑动窗口；标量而非学习模型 —— 最简可审计的 local→global 映射。 |
+| `compare_graphs(before, after)` | 按节点的实际节省：`before.cost - after.cost`。真实图算术 —— 绝不查阅仿真器的投影。当两个图观测到不同运行数时，归一化为按调用节省并重新投影到 before 体量。出现在 `before` 但在 `after` 缺失的节点贡献其完整 before-cost 作为节省。 |
+| `verify_plan(plan, before_graph, after_graph)` | 把每个接受方案的 `expected_savings["cost_delta_usd"]`（投影）与其 `target_node_id` 的实际节省配对。拒绝的方案不校验（从未部署）。 |
+| `update_calibration(state, result)` | 把一个 `VerificationResult` 折入运行中的 `CalibrationState`；只有投影节省非零的可校验方案才贡献给 `τ`。 |
+| `calibrated_projection(raw, τ)` | 把 `τ` 应用于原始投影；`τ is None` 时原样返回原始值（冷启动）。治理把原始投影变为校准投影时调用的唯一函数。 |
+| `render_verification_markdown(result)` | 把 `VerificationResult` 渲染为可 Git diff 的 Markdown 文档（YAML 前置元数据 + `## Summary` + `## Per-Proposal Errors` + `## Per-Node Actual Savings`），与 `render_analysis_markdown` 平行。 |
+| `VERIFICATION_COT_PROMPT` | 校验子智能体的思维链 prompt：何时运行（≥1 条同智能体的部署后 trace）、如何校验（真实图算术）、如何更新 `τ`、以及诚实契约（绝不伪造实际节省；显式标记不可校验目标；诚实回显冷启动）。 |
+
+**诚实契约。** `compare_graphs` 做真实图算术，绝不读取仿真器的投影。`verify_plan`
+只在方案的 `target_node_id` 在*两个*图中都能解析时才把方案与现实配对；否则方案被报告
+为 `unverifiable`，绝不静默丢弃或归零。`τ` 直到存在一个真实的 `(projected, actual)`
+对之前为 `None`，因此冷启动路径是显式的，系统优雅退化为今天的开环行为。
+
+### `agents.py` —— 多智能体架构
+
+把分析 / 优化过程拆分为四个由一个 orchestrator 协调的专用子智能体，外加第五个校验
+子智能体在方案部署后闭合投影→实际环：
+
+```
+┌──────────────┐   payloads   ┌──────────────┐  traces  ┌──────────────┐
+│ IngestAgent  │ ───────────► │ ModelingAgent│ ───────► │SimulationAgent│
+│              │   traces     │ (+ AutoML)   │  graph   │              │
+└──────────────┘              └──────────────┘  props   └──────┬───────┘
+                                                                   │ validated
+                                                                   ▼
+                                                       ┌──────────────────┐
+                                                       │ GovernanceAgent  │
+                                                       │  (decide+memory) │─── plan ──┐
+                                                       └──────────────────┘           │
+                                                                                      ▼
+                                                        ┌────────────────────────────┐
+部署后 traces ──────────────────────────────────────►   │ VerificationAgent          │
+                                                        │  校验投影 vs 实际           │
+                                                        │  更新校准 τ                 │
+                                                        └─────────────┬──────────────┘
+                                                                      │ τ（跨轮次）
+                                                                      ▼
+                                                        下一轮 GovernanceAgent.run()
+                                                        在 calibrated_projection(P, τ) 上定夺
+```
+
+每个子智能体操作共享的 `AnalysisRecord` 并追加 `AnalysisStep` 对象。因此多智能体轨迹
+*即* `AnalysisRecord`。
+
+**设计要点：**
+* **纯 Python，无活跃 LLM。** 每个智能体是一个带 `run` 方法的普通类。角色 CoT prompt
+  （`*_ROLE`）与真实 `deepagents` 子智能体被播种的 prompt 相同 —— 把它们接入真实 LLM
+  子智能体是机械步骤（把 `role.cot_prompt` 作为系统 prompt，把 `run` 的函数体暴露为工具）。
+* **同步内核，异步接缝。** Ingest / Modelling / Simulation 是纯 CPU 工作并保持同步。
+  Governance 与 Verification 是 `async`，因为它们触碰异步的 `PartitionedMemory`。
+  `Orchestrator` 也是 `async` 以匹配。
+* **AutoML 提议，仿真器定夺。** 无方案在未校验时进入方案。
+* **仿真器投影，现实定夺。** 校验是闭环：已部署方案的投影节省与部署后 trace 中兑现的
+  节省比较，差距折入校准乘子 `τ`，下一轮治理把它应用于其原始投影（见 `verification.py`）。
+  当 `τ = None`（冷启动）时治理行为与之前完全一致。
+
+| 类型 | 角色 |
+|---|---|
+| `AgentRole` | 一个子智能体的声明式描述：`name`、`description`、`cot_prompt`、`inputs`、`outputs`。CoT prompt 兼作同步 `run` 方法的文档。 |
+| `INGEST_ROLE` / `MODELING_ROLE` / `SIMULATION_ROLE` / `GOVERNANCE_ROLE` / `VERIFICATION_ROLE` | 五个角色定义。`MODELING_ROLE.cot_prompt` 为 `AUTOML_COT_PROMPT`；`VERIFICATION_ROLE.cot_prompt` 为 `VERIFICATION_COT_PROMPT`。 |
+| `ModelingOutput` | 建模智能体交给仿真智能体的内容：`graph`、`graph_md`（AutoML 富化后）、`report`、`automl_target`。 |
+| `IngestAgent` | 把原始 payload 适配为 `CanonicalTrace`。每条 payload 一个 `INGEST` 步骤（出错 FAILED，继续处理其余）；末尾一个汇总步骤（无 trace 产出时 FAILED）。 |
+| `ModelingAgent` | 构建执行图（始终）；运行 AutoML（仅 ≥3 条 trace）；把每条建议转为 `OptimizationProposal` + `PROPOSE` 步骤。trace <3 时记录“样本不足”步骤并仅产出描述性图。 |
+| `SimulationAgent` | 通过 `simulate_graph` 对聚合图基线校验每个方案（方案目标为聚合 node_id）。通过 `project_savings` 填 `expected_savings`；仅当无分歧且成本差 ≥ 0 时标记 `validated=True`。每个方案一个 `VALIDATE` 步骤。 |
+| `GovernanceAgent` | `async`。当且仅当方案校验通过且其*校准后*节省 `calibrated_projection(cost_delta_usd, τ) >= min_savings_usd` 时接受。当 `τ` 从先前校验轮次召回时，阈值应用于 `τ · projected` 而非原始投影；原始 `expected_savings` 绝不被覆盖（`τ` 记录在 `proposal.calibration_applied` 与 `plan.calibration_applied`）。构建 `GovernancePlan`，撰写摘要（呈现 AutoML 头号特征 + 低样本警告 + 校准状态），结束记录。可选地通过 `PartitionedMemory` 召回/记忆（`RECALL`/`REMEMBER` 步骤）。 |
+| `VerificationAgent` | `async`。在方案部署且采集到 ≥1 条同智能体部署后 trace 后运行。构建 after-graph，调用 `verify_plan`（真实图算术），从语义记忆召回智能体的 `CalibrationState`，通过 `update_calibration` 折入结果，持久化更新后的 `τ`，并把每个已校验方案的 `actual_savings` + `verified` 盖到方案上。记录 `VERIFY` 与（有记忆时）`RECALL`/`REMEMBER` 步骤。 |
+| `Orchestrator` | `async`。一轮治理的公开入口。持有 `AnalysisRecord`，依次交给各子智能体。`run()` 返回 `(record, plan)`；`run_with_markdown()` 同时返回渲染后的轨迹 MD。无 trace 采集时短路为空方案（但仍诚实记录轨迹）。当 `memory` 接入且 `calibration_multiplier` 未被显式钉住时，`run()` 从语义记忆召回 `τ` 使决策校准；`verify_round()` 是闭环的下半场（采集部署后 payload → 校验 → 更新 `τ`）。 |
+| `run_sync(**kwargs)` | `Orchestrator().run()` 的同步包装，供脚本/测试使用。 |
+
 ### `storage/` —— Workspace 存储
 
 voyage_trace 与其持久化层之间的唯一接口。async-first（`deepagents` 运行时是
@@ -269,6 +477,7 @@ trace、方案与记忆分区的后端 —— 即唯一真源。
                            ▼
                   WorkspaceStorage（InMemoryStorage | PostgresStorage）
                   namespace: traces | execution_graphs | governance_plans
+                             | analysis_records | verification_results
                              | memory/<agent>/<partition>/<round> | raw
 ```
 
@@ -289,10 +498,29 @@ trace、方案与记忆分区的后端 —— 即唯一真源。
      `project_savings` 比较基线与修改后运行。
    * `PartitionedMemory` 及其分区按 `(target_agent_id, round_id)` 范围持久化发现、
      规则、模板与草稿状态。
-5. **持久化（Persist）** —— 每个产物（trace、执行图、治理方案、记忆记录、原始
-   payload）落入同一个 `WorkspaceStorage` 后端。`StorageBackedBackend` 把这同一个
-   后端暴露给 `deepagents` 智能体的文件工具，使智能体的文件视图与 voyage_trace 的
-   结构化视图完全一致。
+5. **治理（Govern，多智能体编排）** —— `agents.Orchestrator` 端到端运行一轮治理，
+   把单个 `AnalysisRecord` 贯穿各子智能体：
+   * `IngestAgent` → `ModelingAgent`（构建图 + AutoML）→ `SimulationAgent`（校验
+     方案）→ `GovernanceAgent`（决策 + 记忆）。每个子智能体向共享记录追加
+     `AnalysisStep`，因此分析轨迹本身就是一个一等、可 diff 的产物。
+   * AutoML 用 `## Learned Signals` / `## Suggested Modifications` 富化执行图 MD；
+     仿真器在治理智能体接受前校验每条建议（**AutoML 提议，仿真器定夺**）。
+   * 当 `memory` 接入时，orchestrator 召回按智能体的校准乘子 `τ`（由先前
+     `verify_round` 写入）并交给 `GovernanceAgent`，使接受/拒绝决策基于
+     `calibrated_projection(raw, τ)` 而非原始投影（**仿真器投影，现实定夺**）。
+     `τ = None`（冷启动）时原始投影不变。
+6. **校验（Verify，闭环）** —— 在方案部署后，运营者采集同一目标智能体的部署后
+   trace 并调用
+   `Orchestrator.verify_round(plan, before_graph, after_payloads, memory=…)`。
+   它通过真实的 `IngestAgent` 重新采集 after-payloads，构建 after-graph，并由
+   `verify_plan` 把每个接受方案的投影与其 `target_node_id` 的实际节省配对
+   （真实图算术，绝不查阅仿真器自身的输出）。差距折入 `CalibrationState` 并持久化到
+   语义记忆，使下一轮治理召回一个已校准的 `τ`。这是严格加性的反馈路径：`τ = None`
+   （冷启动）时系统退化为开环行为。
+7. **持久化（Persist）** —— 每个产物（trace、执行图、治理方案、分析记录、校验结果、
+   记忆记录、原始 payload）落入同一个 `WorkspaceStorage` 后端。
+   `StorageBackedBackend` 把这同一个后端暴露给 `deepagents` 智能体的文件工具，
+   使智能体的文件视图与 voyage_trace 的结构化视图完全一致。
 
 ## 4. 设计原则
 
@@ -316,6 +544,12 @@ trace、方案与记忆分区的后端 —— 即唯一真源。
   `memory/<target_agent_id>/<partition>/<round_id>` 之下。不同的目标智能体，以及
   同一目标智能体的不同治理轮次，从不共享命名空间。跨轮次 / 跨智能体召回通过通配符
   scope（`round_id="*"`、`target_agent_id="*"`）显式 opt-in。
+* **AutoML 提议，仿真器定夺。** AutoML 排序关联并浮现候选，但仿真器 —— 而非
+  AutoML —— 是“变更是否真有帮助”的权威。无方案在未经 `simulate` 校验时进入治理方案。
+* **仿真器投影，现实定夺。** 仿真器的投影节省是一次*预测*，而非*测量*。校验子智能体
+  用真实图算术（`before.cost - after.cost`）测量实际节省，把投影与实际之间的差距折入
+  按智能体的校准乘子 `τ = Σactual / Σprojected`，下一轮治理在 `τ · projected` 上定夺。
+  `τ = None`（冷启动）时原始投影不变 —— 闭环是严格加性的，从不移除仿真器或伪造节省。
 
 ## 5. 存储命名空间约定
 
@@ -327,7 +561,9 @@ trace、方案与记忆分区的后端 —— 即唯一真源。
 | `traces` | 归一化的 `CanonicalTrace` JSON 文档，每次被观察的智能体运行一份。 |
 | `execution_graphs` | 渲染后的执行图 Markdown 文档（智能体形态的 canonical 落盘表示）。 |
 | `governance_plans` | 元智能体产出的治理 / 优化方案。 |
-| `memory/<target_agent_id>/<partition>/<round_id>` | 分区记忆记录。`<partition>` 为 `episodic`、`semantic`、`procedural`、`working` 之一。`(target_agent_id, round_id)` 对是隔离单元。 |
+| `analysis_records` | 一轮治理的 `AnalysisRecord` —— 元智能体自身从 payload → 方案 → 已校验方案的轨迹。 |
+| `verification_results` | 校验轮次的 `VerificationResult` —— 每个接受方案的投影 vs 实际节省配对。 |
+| `memory/<target_agent_id>/<partition>/<round_id>` | 分区记忆记录。`<partition>` 为 `episodic`、`semantic`、`procedural`、`working` 之一。`(target_agent_id, round_id)` 对是隔离单元。校准状态 `CalibrationState` 存于语义分区，伪轮次 `_calibration` 下固定键 `calibration_state`。 |
 | `raw` | 适配前的原始 payload，留作审计 / 重新适配。 |
 
 命名空间在首次写入时创建，可通过 `WorkspaceStorage.namespaces()` 枚举。键可包含

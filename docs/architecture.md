@@ -226,12 +226,12 @@ artefact.
 
 | Type | Kind | Purpose |
 |---|---|---|
-| `AnalysisStepKind` | `str, Enum` | What kind of step: `INGEST`, `MODEL`, `SIMULATE`, `PROPOSE`, `VALIDATE`, `DECIDE`, `REMEMBER`, `RECALL`. Mirrors the pipeline stages so a record can be filtered by stage without parsing free text. |
+| `AnalysisStepKind` | `str, Enum` | What kind of step: `INGEST`, `MODEL`, `SIMULATE`, `PROPOSE`, `VALIDATE`, `DECIDE`, `REMEMBER`, `RECALL`, `VERIFY`. Mirrors the pipeline stages so a record can be filtered by stage without parsing free text. `VERIFY` is appended by the verification sub-agent after a plan is deployed. |
 | `StepStatus` | `str, Enum` | Outcome of one step: `SUCCESS`, `FAILED`, `SKIPPED`. |
 | `ProposalDecision` | `str, Enum` | Governance decision: `ACCEPTED`, `REJECTED`, `DEFERRED`. |
 | `AnalysisStep` | `@dataclass` | One step of the meta-agent's trajectory: `kind`, `agent_role`, `rationale` (one-line CoT), `inputs`/`outputs` summaries, `artifacts` (`{namespace: key}` pointers into storage), `status`, `note`. `finish(status, note)` stamps `ended_at`. |
-| `OptimizationProposal` | `@dataclass` | A candidate optimisation: wraps a `Modification` with `rationale`, `expected_savings` (filled by the simulator), `validated` flag, and a `decision`. `accept()`/`reject()` stamp the decision. |
-| `GovernancePlan` | `@dataclass` | Final output of one round: accepted/rejected proposal lists, a human-readable `summary`, `metrics`, and `analysis_record_id` back-reference. `total_projected_savings_usd` sums accepted savings. |
+| `OptimizationProposal` | `@dataclass` | A candidate optimisation: wraps a `Modification` with `rationale`, `expected_savings` (the simulator's *raw* projection), `validated` flag, and a `decision`. `accept()`/`reject()` stamp the decision. Closed-loop fields: `actual_savings` (observed savings, filled by the verification agent), `verified` flag, and `calibration_applied` (the multiplier `τ` governance used, `None` = cold start). |
+| `GovernancePlan` | `@dataclass` | Final output of one round: accepted/rejected proposal lists, a human-readable `summary`, `metrics`, and `analysis_record_id` back-reference. `total_projected_savings_usd` sums the simulator's raw projections; `total_actual_savings_usd` sums observed savings over *verified* accepted proposals (stays 0.0 until a verification round runs). `calibration_applied` and `verification_id` make the closed loop visible at the plan level. |
 | `AnalysisRecord` | `@dataclass` | The complete ordered trajectory of one round: `steps`, `proposals`, `plan`. Threaded through every sub-agent. `ok` is True iff no step failed and a plan was produced. |
 
 **JSON serialisation** — round-trippable, mirrors `protocol.py`'s style:
@@ -334,10 +334,86 @@ and recommends collecting more traces. When fewer than `min_samples`
 (default 3) traces were observed, a low-sample warning is appended to
 `notes` — the count is based on `observed_runs` (traces), not node count.
 
+### `verification.py` — Closed-loop verification of projected vs actual savings
+
+The rest of voyage_trace is an **open loop**: the simulator *projects* what
+a `Modification` would save, the governance agent accepts proposals whose
+projected savings clear a threshold, and the plan is emitted — but nothing
+ever checks whether the projected savings *materialised* once the plan was
+deployed. Every accepted proposal is therefore a prediction with no
+measurement of prediction error and no mechanism to correct systematic bias
+in the predictor.
+
+This module closes that loop. It is the voyage_trace adaptation of the
+**Local Reward Function (LRF)** pattern from OPTIMAS (Wu et al., ICLR 2026,
+arXiv:2507.03041): a learned, per-component local→global mapping re-aligned
+each iteration as the system drifts. Here the "local signal" is the
+simulator's projected savings, the "global outcome" is the actual savings
+observed by re-ingesting post-deployment traces, and the "LRF" is a single
+scalar calibration multiplier `τ = Σactual / Σprojected` per target agent.
+Three pieces of published evidence motivate the design:
+
+* **Aggregate projections mislead.** Counterfactual Trace Auditing
+  (arXiv:2605.11946) found aggregate ΔP ≈ 0 while the underlying agent
+  behaviour changed 696 times — a projected-savings total is an unreliable
+  signal of real impact.
+* **Un-verified proposals systematically overshoot.** TextualVerifier
+  (arXiv:2511.03739) showed that adding a verification step to text-gradient
+  proposals recovers +2 to +10pp on the held-out metric.
+* **A learned local→global map beats raw judging.** OPTIMAS reports LRF
+  ranking accuracy of 77.96% vs 49.52% for an LLM judge, and re-fits the
+  LRF every iteration to track drift.
+
+The closure is the feedback path through `τ`:
+
+```
+    round N                     round N+1 (post-deployment)
+┌──────────────┐               ┌────────────────────────┐
+│ AutoML       │               │ ingest after-traces    │
+│ simulator    │               │ build after-graph      │
+│  projected P │               │   actual A             │
+│  governance  │ ◄─────────────┤   verify_plan(P, A)    │
+│  accepts on P│               │   update_calibration τ │
+└──────┬───────┘               └────────────────────────┘
+       │                                  │
+       ▼                                  ▼
+next round's governance           τ = ΣA / ΣP  (per target agent)
+decides on  τ · projected         persisted in semantic memory,
+                                   recalled cross-round
+```
+
+With `τ = None` (cold start, no verification history) the system behaves
+exactly as before — `calibrated_projection` returns the raw projection
+unchanged. As post-deployment traces accumulate, `τ` converges toward the
+true projector bias and governance decisions become calibrated. This is
+strictly an additive feedback path: it never removes the simulator, never
+fabricates savings, and never mutates a recorded trace.
+
+| Type / Function | Role |
+|---|---|
+| `ProjectionError` | The gap between one proposal's projected and actual savings. `actual_usd` is `None` when the target node could not be matched in the after-graph — such proposals are `unverifiable` and excluded from `τ`. `error_usd` (positive = optimistic) and `relative_error` are derived. |
+| `VerificationResult` | Outcome of verifying one `GovernancePlan` against reality. Carries `projection_errors`, per-node `node_actual_savings`, `comparison_mode` (`"totals"` when before/after `observed_runs` match, else `"per_call_projected"`), and the aggregate totals (`total_projected_usd`, `total_actual_usd`, `total_error_usd`, `mean_relative_error`). |
+| `CalibrationState` | Running calibration of the simulator's projector for one agent: `τ = sum_actual / sum_projected` over every `(projected, actual)` pair ever observed. `tau` is `None` until one observation with non-zero projected savings exists (cold start). Cumulative, not windowed; scalar, not a learned model — the simplest auditable local→global map. |
+| `compare_graphs(before, after)` | Per-node actual savings: `before.cost - after.cost` per node. REAL graph arithmetic — it never consults the simulator's projection. Normalises to per-call savings and re-projects to the before volume when the two graphs observed different run counts. Nodes present in `before` but absent in `after` contribute their full before-cost as savings. |
+| `verify_plan(plan, before_graph, after_graph)` | Pairs each accepted proposal's `expected_savings["cost_delta_usd"]` (projected) with the actual savings of its `target_node_id`. Rejected proposals are not verified (never deployed). |
+| `update_calibration(state, result)` | Folds one `VerificationResult` into a running `CalibrationState`; only verifiable proposals with non-zero projected savings contribute to `τ`. |
+| `calibrated_projection(raw, τ)` | Applies `τ` to a raw projection; returns the raw value unchanged when `τ is None` (cold start). The single function governance calls to turn a raw projection into a calibrated one. |
+| `render_verification_markdown(result)` | Renders a `VerificationResult` as a Git-diffable Markdown document (YAML front-matter + `## Summary` + `## Per-Proposal Errors` + `## Per-Node Actual Savings`), parallel to `render_analysis_markdown`. |
+| `VERIFICATION_COT_PROMPT` | Chain-of-thought prompt seeding the verification sub-agent: when to run (≥1 post-deployment trace of the same agent), how to verify (real graph arithmetic), how to update `τ`, and the honesty contract (never fabricate actual savings; mark unverifiable targets explicitly; echo cold-start honestly). |
+
+**Honesty contract.** `compare_graphs` does real graph arithmetic and never
+reads the simulator's projection. `verify_plan` only pairs a proposal with
+reality when its `target_node_id` resolves in *both* graphs; otherwise the
+proposal is reported `unverifiable`, never silently dropped or zeroed. `τ`
+is `None` until a real `(projected, actual)` pair exists, so the cold-start
+path is explicit and the system degrades gracefully to today's open-loop
+behaviour.
+
 ### `agents.py` — Multi-agent architecture
 
 Splits the analysis / optimisation process into four specialised
-sub-agents coordinated by one orchestrator:
+sub-agents coordinated by one orchestrator, plus a fifth verification
+sub-agent that closes the projection→actual loop AFTER a plan is deployed:
 
 ```
 ┌──────────────┐   payloads   ┌──────────────┐  traces  ┌──────────────┐
@@ -348,8 +424,18 @@ sub-agents coordinated by one orchestrator:
                                                                    ▼
                                                        ┌──────────────────┐
                                                        │ GovernanceAgent  │
-                                                       │  (decide+memory) │
-                                                       └──────────────────┘
+                                                       │  (decide+memory) │─── plan ──┐
+                                                       └──────────────────┘           │
+                                                                                      ▼
+                                                        ┌────────────────────────────┐
+post-deployment traces ──────────────────────────────►  │ VerificationAgent          │
+                                                        │  verify projected vs actual│
+                                                        │  update calibration τ      │
+                                                        └─────────────┬──────────────┘
+                                                                      │ τ (cross-round)
+                                                                      ▼
+                                                        next GovernanceAgent.run() decides
+                                                        on  calibrated_projection(P, τ)
 ```
 
 Every sub-agent operates on a shared `AnalysisRecord` and appends
@@ -363,21 +449,29 @@ Every sub-agent operates on a shared `AnalysisRecord` and appends
   sub-agents is a mechanical step (pass `role.cot_prompt` as the system
   prompt and expose `run`'s body as tools).
 * **Sync core, async seam.** Ingest / Modelling / Simulation are pure CPU
-  work and stay sync. Governance is `async` because it touches the async
-  `PartitionedMemory`. The `Orchestrator` is `async` to match.
+  work and stay sync. Governance and Verification are `async` because they
+  touch the async `PartitionedMemory`. The `Orchestrator` is `async` to
+  match.
 * **AutoML proposes, simulator disposes.** No proposal reaches the plan
   unvalidated.
+* **The simulator projects, reality disposes.** Verification is the closed
+  loop: a deployed plan's projected savings are compared to the savings
+  that materialised in post-deployment traces, and the gap is folded into
+  a calibration multiplier `τ` that the next governance round applies to
+  its raw projections (see `verification.py`). With `τ = None` (cold start)
+  governance behaves exactly as before.
 
 | Type | Role |
 |---|---|
 | `AgentRole` | Declarative description of one sub-agent: `name`, `description`, `cot_prompt`, `inputs`, `outputs`. The CoT prompt doubles as documentation for the sync `run` method. |
-| `INGEST_ROLE` / `MODELING_ROLE` / `SIMULATION_ROLE` / `GOVERNANCE_ROLE` | The four role definitions. `MODELING_ROLE.cot_prompt` is `AUTOML_COT_PROMPT`. |
+| `INGEST_ROLE` / `MODELING_ROLE` / `SIMULATION_ROLE` / `GOVERNANCE_ROLE` / `VERIFICATION_ROLE` | The five role definitions. `MODELING_ROLE.cot_prompt` is `AUTOML_COT_PROMPT`; `VERIFICATION_ROLE.cot_prompt` is `VERIFICATION_COT_PROMPT`. |
 | `ModelingOutput` | What the modelling agent hands to the simulation agent: `graph`, `graph_md` (AutoML-enriched), `report`, `automl_target`. |
 | `IngestAgent` | Adapts raw payloads into `CanonicalTrace`s. One `INGEST` step per payload (FAILED on error, continues with the rest); a summary step at the end (FAILED if no traces produced). |
 | `ModelingAgent` | Builds the execution graph (always); runs AutoML (≥3 traces only); turns each suggestion into an `OptimizationProposal` + `PROPOSE` step. With <3 traces it records an "insufficient samples" step and produces the descriptive graph only. |
 | `SimulationAgent` | Validates each proposal via `simulate_graph` against an aggregated-graph baseline (proposals target aggregated node_ids). Fills `expected_savings` via `project_savings`; marks `validated=True` iff no divergences AND cost delta ≥ 0. One `VALIDATE` step per proposal. |
-| `GovernanceAgent` | `async`. Accepts a proposal iff validated AND `cost_delta_usd >= min_savings_usd`. Builds the `GovernancePlan`, composes a summary (surfaces AutoML's top feature + low-sample warnings), finishes the record. Optionally recalls/remembers via `PartitionedMemory` (`RECALL`/`REMEMBER` steps). |
-| `Orchestrator` | `async`. Public entry point for one governance round. Owns the `AnalysisRecord`, hands it to each sub-agent in turn. `run()` returns `(record, plan)`; `run_with_markdown()` also returns the rendered trajectory MD. Short-circuits to an empty plan when no traces are ingested. |
+| `GovernanceAgent` | `async`. Accepts a proposal iff validated AND its *calibrated* savings `calibrated_projection(cost_delta_usd, τ) >= min_savings_usd`. When `τ` is recalled from a prior verification round, the threshold is applied to `τ · projected`, not the raw projection; the raw `expected_savings` is never overwritten (`τ` is recorded on `proposal.calibration_applied` and `plan.calibration_applied`). Builds the `GovernancePlan`, composes a summary (surfaces AutoML's top feature + low-sample warnings + the calibration state), finishes the record. Optionally recalls/remembers via `PartitionedMemory` (`RECALL`/`REMEMBER` steps). |
+| `VerificationAgent` | `async`. Runs AFTER a plan is deployed and ≥1 post-deployment trace of the same agent is collected. Builds the after-graph, calls `verify_plan` (real graph arithmetic), recalls the agent's `CalibrationState` from semantic memory, folds the result via `update_calibration`, persists the updated `τ`, and stamps each verified proposal's `actual_savings` + `verified` on the plan. Records `VERIFY` and (with memory) `RECALL`/`REMEMBER` steps. |
+| `Orchestrator` | `async`. Public entry point for one governance round. Owns the `AnalysisRecord`, hands it to each sub-agent in turn. `run()` returns `(record, plan)`; `run_with_markdown()` also returns the rendered trajectory MD. Short-circuits to an empty plan when no traces are ingested. When `memory` is wired and `calibration_multiplier` is not explicitly pinned, `run()` recalls `τ` from semantic memory so decisions are calibrated; `verify_round()` is the second half of the closed loop (ingests post-deployment payloads → verifies → updates `τ`). |
 | `run_sync(**kwargs)` | Synchronous wrapper around `Orchestrator().run()` for scripts/tests. |
 
 ### `storage/` — Workspace storage
@@ -459,6 +553,7 @@ artefact to the next.
                            ▼
                   WorkspaceStorage (InMemoryStorage | PostgresStorage)
                   namespace: traces | execution_graphs | governance_plans
+                             | analysis_records | verification_results
                              | memory/<agent>/<partition>/<round> | raw
 ```
 
@@ -482,7 +577,7 @@ Stage-by-stage:
      templates and scratch state scoped by `(target_agent_id, round_id)`.
 5. **Govern (multi-agent orchestration)** — the
    `agents.Orchestrator` runs one governance round end to end, threading a
-   single `AnalysisRecord` through four sub-agents:
+   single `AnalysisRecord` through the sub-agents:
    * `IngestAgent` → `ModelingAgent` (builds graph + AutoML) →
      `SimulationAgent` (validates proposals) → `GovernanceAgent` (decides +
      memory). Each appends `AnalysisStep`s to the shared record, so the
@@ -491,11 +586,28 @@ Stage-by-stage:
      `## Suggested Modifications`; the simulator validates each suggestion
      before the governance agent accepts it (**AutoML proposes, simulator
      disposes**).
-6. **Persist** — every artefact (traces, execution graphs, governance plans,
-   analysis records, memory records, raw payloads) lands in one
-   `WorkspaceStorage` backend. `StorageBackedBackend` exposes that same
-   backend to the `deepagents` agent's file tools, so the agent's file view
-   and voyage_trace's structured view are fully consistent.
+   * When `memory` is wired, the orchestrator recalls the per-agent
+     calibration multiplier `τ` (written by a prior `verify_round`) and
+     hands it to `GovernanceAgent`, so accept/reject decisions are made on
+     `calibrated_projection(raw, τ)` rather than the raw projection
+     (**the simulator projects, reality disposes**). `τ = None` (cold start)
+     leaves the raw projection unchanged.
+6. **Verify (the closed loop)** — AFTER a plan is deployed, the operator
+   collects post-deployment traces of the same target agent and calls
+   `Orchestrator.verify_round(plan, before_graph, after_payloads, memory=…)`.
+   It re-ingests the after-payloads through the real `IngestAgent`, builds
+   the after-graph, and `verify_plan` pairs each accepted proposal's
+   projected savings with the actual savings from `compare_graphs` (real
+   graph arithmetic — never the simulator's projection). The gap is folded
+   into `CalibrationState` (`τ = Σactual / Σprojected`) and persisted to
+   semantic memory under a fixed pseudo-round namespace, so the *next*
+   governance round (step 5) recalls it. This is the feedback path that
+   closes the loop.
+7. **Persist** — every artefact (traces, execution graphs, governance plans,
+   analysis records, verification results, memory records, raw payloads)
+   lands in one `WorkspaceStorage` backend. `StorageBackedBackend` exposes
+   that same backend to the `deepagents` agent's file tools, so the agent's
+   file view and voyage_trace's structured view are fully consistent.
 
 ## 4. Design Principles
 
@@ -539,6 +651,19 @@ Stage-by-stage:
   `Modification`s, but no candidate reaches the plan until the simulator
   validates it with `project_savings`. Correlation is never presented as
   causation.
+* **The simulator projects, reality disposes.** The simulator's projected
+  savings are a *prediction*, not a measurement. `verification.py` closes
+  the loop by comparing each accepted proposal's projection to the savings
+  that materialised in post-deployment traces (real graph arithmetic,
+  never the simulator's own output) and folding the gap into a scalar
+  calibration multiplier `τ = Σactual / Σprojected` per target agent. The
+  next governance round decides on `calibrated_projection(raw, τ)`. `τ` is
+  `None` (not 1.0) until a real `(projected, actual)` pair exists, so the
+  cold-start path is explicit and the system degrades gracefully to the
+  open-loop behaviour. Verification is strictly additive: it never removes
+  the simulator, never fabricates savings, and never mutates a recorded
+  trace. Proposals whose target node vanished post-deployment are reported
+  `unverifiable`, never silently zeroed.
 * **AutoGluon-backed AutoML.** `automl.py` wraps
   [AutoGluon](https://auto.gluon.ai/stable/index.html) TabularPredictor for
   model selection and ensembling. AutoGluon is imported lazily inside
@@ -558,7 +683,8 @@ a logical bucket. By convention:
 | `execution_graphs` | Rendered execution-graph Markdown documents (the canonical on-disk representation of an agent's shape). |
 | `governance_plans` | Governance / optimisation plans produced by the meta-agent. |
 | `analysis_records` | `AnalysisRecord` JSON (and rendered Markdown) — the full step-by-step trajectory of how each governance round was produced. |
-| `memory/<target_agent_id>/<partition>/<round_id>` | Partitioned memory records. `<partition>` is one of `episodic`, `semantic`, `procedural`, `working`. The `(target_agent_id, round_id)` pair is the unit of isolation. |
+| `verification_results` | `VerificationResult` JSON (and rendered Markdown) — the projected-vs-actual comparison for one deployed plan, one per `verify_round` call. |
+| `memory/<target_agent_id>/<partition>/<round_id>` | Partitioned memory records. `<partition>` is one of `episodic`, `semantic`, `procedural`, `working`. The `(target_agent_id, round_id)` pair is the unit of isolation. The per-agent `CalibrationState` (the closed-loop `τ`) lives in the `semantic` partition under the fixed pseudo-round `_calibration` and key `calibration_state`, so it is recallable across governance rounds. |
 | `raw` | Raw, pre-adaptation payloads kept for audit / re-adaptation. |
 
 Namespaces are created on first write and enumerated via

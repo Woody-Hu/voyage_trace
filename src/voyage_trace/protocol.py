@@ -69,8 +69,10 @@ def make_dotted_order(start_time: datetime, span_id: str, parent_order: str | No
     returned alone.
     """
     # Use a stable, deterministic suffix derived from the span id so that
-    # replay/regeneration produces identical dotted_orders.
-    suffix = span_id.replace("-", "")[:24].ljust(24, "0") if span_id else uuid.uuid4().hex[:24]
+    # replay/regeneration produces identical dotted_orders. Hyphens (UUIDs)
+    # and underscores (category names like ``self_harm``) are stripped so the
+    # suffix stays within the dotted-order alphabet (``[0-9A-Za-z]``).
+    suffix = re.sub(r"[_-]", "", span_id)[:24].ljust(24, "0") if span_id else uuid.uuid4().hex[:24]
     segment = f"{format_dotted_timestamp(start_time)}{suffix}"
     if parent_order:
         return f"{parent_order}.{segment}"

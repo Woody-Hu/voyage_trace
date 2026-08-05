@@ -7,7 +7,7 @@ name = "voyage-trace"
 version = "0.1.0"
 description = "A meta-agent that collects other agents' execution traces and produces governance/optimization plans. Built on the deepagents extension mechanism."
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.14"
 license = { text = "MIT" }
 authors = [{ name = "voyage_trace" }]
 keywords = ["agents", "tracing", "observability", "governance", "deepagents", "langgraph"]
@@ -19,7 +19,6 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
-    "Programming Language :: Python :: 3.14",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 
@@ -33,8 +32,10 @@ dependencies = [
     "psycopg-pool>=3.2,<4",
     # Serialization
     "pyyaml>=6.0",
-    # AutoML — wrapped by voyage_trace.automl for trace-driven modelling
-    "autogluon.tabular>=1.0",
+    # AutoML — wrapped by voyage_trace.automl for trace-driven modelling.
+    # Pinned: 1.5.0 is the latest stable; supports CPython 3.10–3.13.
+    # (AutoGluon does NOT support Python 3.14 yet — see requires-python above.)
+    "autogluon.tabular>=1.4.0,<2",
     # deepagents already pulls langchain / langgraph transitively.
 ]
 
@@ -42,6 +43,25 @@ dependencies = [
 test = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
+]
+# Optional integrations — imported lazily; never required for core voyage_trace.
+# Each adapter degrades gracefully to a no-op / ImportError-with-message when
+# the upstream package is absent.
+integrations = [
+    "deepeval>=2.0",
+    "flaml[automl]>=2.1",
+    # langfuse SDK for native push-side export (optional; the Langfuse adapter
+    # already works on raw payloads without it).
+    "langfuse>=2.0",
+]
+# Sample agents (deepagents-powered digital-employee examples). Kept optional
+# so the core library stays light; the samples import deepagents directly.
+# langchain-openai is the chat-model backend used by sample_agents.llm_config
+# to build a real DeepSeek/OpenAI chat model for e2e runs.
+samples = [
+    "deepagents>=0.6.0",
+    "langchain-openai>=0.2,<2",
+    "pyyaml>=6.0",
 ]
 
 [project.urls]

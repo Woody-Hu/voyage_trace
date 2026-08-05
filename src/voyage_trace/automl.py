@@ -74,6 +74,38 @@ FEATURE_NAMES: tuple[str, ...] = (
 # governance target; ``error_rate`` is also useful (predict fragility).
 TARGETS: tuple[str, ...] = ("cost_usd", "total_tokens", "total_duration_s")
 
+# Hard leakage map: a feature that IS the target, or a deterministic
+# transform of it, would let AutoGluon "win" by identity rather than by
+# learning. Predicting ``total_tokens`` from a ``total_tokens`` feature is a
+# trivial identity; including it would be cheating. ``run_automl`` drops
+# these features automatically per-target and records what it dropped on the
+# report (honesty contract). Soft leakage (e.g. ``total_tokens`` ≈
+# ``cost_usd`` × price) is NOT dropped — tokens genuinely drive cost — but
+# is flagged in :data:`SOFT_LEAKAGE_NOTES` so the reviewer sees the caveat.
+LEAKAGE_BY_TARGET: dict[str, frozenset[str]] = {
+    "total_tokens": frozenset({"total_tokens"}),
+}
+SOFT_LEAKAGE_NOTES: dict[str, str] = {
+    "cost_usd": (
+        "total_tokens is highly correlated with cost_usd (cost ≈ tokens × price). "
+        "It is kept as a feature because tokens genuinely drive cost, but a high "
+        "R² here partly reflects this near-deterministic relationship, not only "
+        "learned signal. Treat the importance as directional."
+    ),
+}
+
+
+def leakage_safe_features(target: str) -> tuple[str, ...]:
+    """Return the feature set with hard-leakage features for ``target`` removed.
+
+    A feature that equals the target (e.g. ``total_tokens`` when predicting
+    ``total_tokens``) is identity leakage — leaving it in would let AutoGluon
+    score a trivial R²=1 by memorising the target. This guard is the
+    anti-cheating boundary: AutoML must *learn* a relationship, not echo one.
+    """
+    drop = LEAKAGE_BY_TARGET.get(target, frozenset())
+    return tuple(f for f in FEATURE_NAMES if f not in drop)
+
 
 @dataclass
 class FeatureMatrix:
@@ -185,6 +217,25 @@ class TrainedModel:
 
 
 @dataclass
+class MeanBaseline:
+    """The "predict the training mean" reference model.
+
+    By construction a mean-predictor has R² = 0 on held-out data and
+    RMSE = std(target) on the training set. :attr:`beats_baseline` records
+    whether the trained AutoGluon model is *actually* better than this
+    trivial reference — the honest "is there any signal at all?" test. A
+    model that fails to beat the mean baseline has learned nothing usable,
+    no matter how positive its in-sample R² looks.
+    """
+
+    rmse: float  # std of the training target (mean-predictor RMSE)
+    mae: float  # mean absolute deviation of the training target
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"rmse": self.rmse, "mae": self.mae}
+
+
+@dataclass
 class AutoMLReport:
     """The full output of :func:`run_automl`.
 
@@ -203,6 +254,15 @@ class AutoMLReport:
     high_error_nodes: list[tuple[str, float]]  # (node_id, error_rate)
     suggested_modifications: list[tuple[Modification, str]]  # (mod, rationale)
     notes: list[str] = field(default_factory=list)
+    # Leakage / honesty diagnostics (see :func:`leakage_safe_features`).
+    dropped_features: tuple[str, ...] = ()
+    # Mean-predictor baseline + whether the best model actually beats it.
+    mean_baseline: MeanBaseline | None = None
+    beats_baseline: bool | None = None
+    # MAE of the best model (robust, interpretable; complements R²/RMSE).
+    mae: float = 0.0
+    # AutoGluon metric the run was tuned on (``r2`` by default; ``mae`` / etc.).
+    eval_metric: str = "r2"
 
     @property
     def top_feature(self) -> str:
@@ -239,6 +299,11 @@ class AutoMLReport:
                 for m, r in self.suggested_modifications
             ],
             "notes": self.notes,
+            "dropped_features": list(self.dropped_features),
+            "mean_baseline": self.mean_baseline.to_dict() if self.mean_baseline else None,
+            "beats_baseline": self.beats_baseline,
+            "mae": self.mae,
+            "eval_metric": self.eval_metric,
         }
 
 
@@ -254,6 +319,8 @@ def run_automl(
     error_threshold: float = 0.5,
     min_samples: int = 3,
     time_limit: float | None = None,
+    num_bag_sets: int = 10,
+    eval_metric: str = "r2",
     **fit_kwargs: Any,
 ) -> AutoMLReport:
     """Run AutoML over a set of traces (or a pre-aggregated graph).
@@ -262,12 +329,17 @@ def run_automl(
     per-node features drive the target outcome. Pipeline:
 
     1. Build the :class:`FeatureMatrix` (one row per node — the same data
-       as the MD ``## Nodes`` table) and convert to a ``pandas.DataFrame``.
-    2. Fit AutoGluon's ``TabularPredictor`` (regression, ``r2`` metric)
-       with cross-validation (``num_bag_folds=2``) so it works even with
-       the tiny datasets typical of trace analysis.
+       as the MD ``## Nodes`` table) and convert to a ``pandas.DataFrame``,
+       **dropping hard-leakage features for the chosen target** (see
+       :func:`leakage_safe_features`) so AutoML cannot win by identity.
+    2. Fit AutoGluon's ``TabularPredictor`` (regression) with 2-fold
+       bagging and ``num_bag_sets`` repeats (default 10) — variance
+       reduction tailored to the tiny datasets typical of trace analysis,
+       where raising ``num_bag_folds`` would over-fit.
     3. Extract permutation feature importances and normalise to ``[0, 1]``.
-    4. Evaluate the best model in-sample for R² and RMSE.
+    4. Evaluate the best model in-sample for R², RMSE and MAE, and compare
+       it to a *mean-predictor baseline* (``beats_baseline``) — the honest
+       "is there any signal at all?" gate.
     5. Surface top-cost / high-error nodes and turn them into candidate
        :class:`~voyage_trace.simulator.Modification` objects (to be
        validated later by :func:`~voyage_trace.simulator.simulate`).
@@ -295,9 +367,21 @@ def run_automl(
             f"unknown target {target!r}; expected one of {sorted(matrix.targets)}"
         )
 
+    # Hard-leakage guard: never let a feature equal the target.
+    features = leakage_safe_features(target)
+    dropped = tuple(f for f in FEATURE_NAMES if f not in features)
+
     y = matrix.target_column(target)
     n = len(y)
     notes: list[str] = []
+    if dropped:
+        notes.append(
+            f"Dropped hard-leakage feature(s) {list(dropped)} for target "
+            f"{target!r}: a feature that equals the target is identity leakage."
+        )
+    soft = SOFT_LEAKAGE_NOTES.get(target)
+    if soft:
+        notes.append(f"Soft-leakage caveat: {soft}")
 
     # Re-aggregate to get per-node cost/error for suggestions + trace count.
     if graph is None:
@@ -310,8 +394,20 @@ def run_automl(
             f"Aggregate at least {min_samples} traces before acting on importances."
         )
 
-    # --- build DataFrame for AutoGluon ----------------------------------- #
-    df_data: dict[str, list[float]] = {feat: matrix.column(feat) for feat in FEATURE_NAMES}
+    # --- mean-predictor baseline (honesty reference) --------------------- #
+    # A mean-predictor has R²=0 by construction; its RMSE = std(target) and
+    # its MAE = mean(|y - mean(y)|). If the trained model does not beat this,
+    # there is no usable signal — regardless of in-sample R².
+    import numpy as np
+
+    y_arr = np.asarray(y, dtype=float)
+    mean_baseline = MeanBaseline(
+        rmse=float(np.std(y_arr, ddof=0)) if n > 0 else 0.0,
+        mae=float(np.mean(np.abs(y_arr - np.mean(y_arr)))) if n > 0 else 0.0,
+    )
+
+    # --- build DataFrame for AutoGluon (leakage-safe features only) ------- #
+    df_data: dict[str, list[float]] = {feat: matrix.column(feat) for feat in features}
     df_data[target] = y
     df = pd.DataFrame(df_data)
 
@@ -321,19 +417,20 @@ def run_automl(
     all_models: list[TrainedModel] = []
     best_model: TrainedModel
     importances: dict[str, float]
+    best_mae: float = 0.0
 
     with tempfile.TemporaryDirectory() as model_dir:
         predictor = TabularPredictor(
             label=target,
             path=model_dir,
             problem_type="regression",
-            eval_metric="r2",
+            eval_metric=eval_metric,
             verbosity=0,
         )
         predictor.fit(
             df,
             num_bag_folds=2,
-            num_bag_sets=1,
+            num_bag_sets=num_bag_sets,
             num_stack_levels=0,
             time_limit=time_limit,
             raise_on_no_models_fitted=False,
@@ -351,19 +448,19 @@ def run_automl(
                 model_name="(mean)", feature="(mean)",
                 r_squared=0.0, rmse=0.0,
             )
-            importances = {feat: 0.0 for feat in FEATURE_NAMES}
+            importances = {feat: 0.0 for feat in features}
         else:
             # --- feature importance (permutation) ---------------------- #
             raw_fi: dict[str, float] = {}
             try:
                 fi_df = predictor.feature_importance(df, silent=True)
-                for feat in FEATURE_NAMES:
+                for feat in features:
                     if feat in fi_df.index:
                         raw_fi[feat] = abs(float(fi_df.loc[feat, "importance"]))
                     else:
                         raw_fi[feat] = 0.0
             except Exception:
-                raw_fi = {feat: 0.0 for feat in FEATURE_NAMES}
+                raw_fi = {feat: 0.0 for feat in features}
 
             total_imp = sum(raw_fi.values())
             if total_imp > 0:
@@ -376,6 +473,7 @@ def run_automl(
             best_r2 = float(scores.get("r2", 0.0))
             # AutoGluon returns RMSE negated (higher-is-better convention).
             best_rmse = abs(float(scores.get("root_mean_squared_error", 0.0)))
+            best_mae = abs(float(scores.get("mean_absolute_error", 0.0)))
 
             best_model_name = str(predictor.model_best)
             top_feat = max(importances, key=importances.get) if total_imp > 0 else "(mean)"
@@ -407,6 +505,24 @@ def run_automl(
         best_model = TrainedModel(
             model_name="(mean)", feature="(mean)",
             r_squared=0.0, rmse=best_model.rmse,
+        )
+
+    # --- mean-baseline gate: did the model actually beat "predict mean"? - #
+    # beats_baseline is the honest "is there signal?" verdict. A positive
+    # in-sample R² can still lose to the mean baseline on tiny data; only a
+    # strictly smaller RMSE than the mean-predictor's counts as real signal.
+    beats_baseline: bool | None
+    if best_model.is_baseline:
+        beats_baseline = False
+    elif mean_baseline.rmse == 0.0:
+        # Constant target — every model ties the mean baseline; no signal.
+        beats_baseline = False
+    else:
+        beats_baseline = best_model.rmse < mean_baseline.rmse
+    if beats_baseline is False and not best_model.is_baseline:
+        notes.append(
+            "The best model did NOT beat the mean-predictor baseline on RMSE; "
+            "treat its importances as noise and do not act on its suggestions."
         )
 
     # --- node-level signals → candidate modifications -------------------- #
@@ -459,7 +575,7 @@ def run_automl(
     return AutoMLReport(
         target=target,
         n_samples=n,
-        n_features=len(FEATURE_NAMES),
+        n_features=len(features),
         best_model=best_model,
         all_models=all_models,
         feature_importances=importances,
@@ -467,6 +583,11 @@ def run_automl(
         high_error_nodes=high_error[:5],
         suggested_modifications=suggestions,
         notes=notes,
+        dropped_features=dropped,
+        mean_baseline=mean_baseline,
+        beats_baseline=beats_baseline,
+        mae=best_mae,
+        eval_metric=eval_metric,
     )
 
 
@@ -490,7 +611,19 @@ def render_automl_markdown(report: AutoMLReport) -> str:
     lines.append(f"- best_model: `{report.best_model.model_name}` "
                  f"(feature: `{report.best_model.feature}`, "
                  f"R^2={report.best_model.r_squared:.3f}, "
-                 f"RMSE={report.best_model.rmse:.4f})")
+                 f"RMSE={report.best_model.rmse:.4f}, "
+                 f"MAE={report.mae:.4f}, metric={report.eval_metric})")
+    # Honesty panel: leakage drops + mean-baseline verdict. These two lines
+    # make the anti-cheating posture of the run visible in the document.
+    if report.dropped_features:
+        lines.append(f"- dropped_features (hard leakage): {list(report.dropped_features)}")
+    if report.mean_baseline is not None:
+        verdict = ("BEATS baseline" if report.beats_baseline
+                   else "does NOT beat baseline (no usable signal)")
+        lines.append(
+            f"- mean_baseline: RMSE={report.mean_baseline.rmse:.4f}, "
+            f"MAE={report.mean_baseline.mae:.4f} -> {verdict}"
+        )
     lines.append("- feature_importances:")
     for feat, imp in sorted(report.feature_importances.items(),
                             key=lambda kv: kv[1], reverse=True):

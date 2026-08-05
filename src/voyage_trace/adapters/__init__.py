@@ -21,7 +21,9 @@ from typing import Any
 
 from ..types import CanonicalTrace, SourceProtocol
 from .a2a import A2AAdapter
+from .acs import ACSAdapter
 from .base import AdapterError, TraceAdapter
+from .deepeval import DeepEvalAdapter
 from .langfuse import LangfuseAdapter
 from .langsmith import LangSmithAdapter
 from .mcp import MCPAdapter
@@ -34,6 +36,8 @@ ADAPTER_REGISTRY: dict[SourceProtocol, type[TraceAdapter]] = {
     SourceProtocol.OTEL: OTELAdapter,
     SourceProtocol.A2A: A2AAdapter,
     SourceProtocol.MCP: MCPAdapter,
+    SourceProtocol.DEEPEVAL: DeepEvalAdapter,
+    SourceProtocol.ACS: ACSAdapter,
     SourceProtocol.CUSTOM: RawAdapter,
 }
 
@@ -72,6 +76,16 @@ def _infer_protocol(payload: Any) -> SourceProtocol:
             return SourceProtocol.MCP
         if "jsonrpc" in payload or "method" in payload:
             return SourceProtocol.MCP
+        # DeepEval / ACS score verdicts (no SDK; plain-dict shape).
+        if "verdict" in payload and "scores" in payload:
+            return SourceProtocol.ACS
+        if "results" in payload or (
+            "metrics" in payload and isinstance(payload.get("metrics"), list)
+            and payload.get("metrics")
+            and isinstance(payload["metrics"][0], dict)
+            and "is_successful" in payload["metrics"][0]
+        ):
+            return SourceProtocol.DEEPEVAL
         return SourceProtocol.CUSTOM
     if isinstance(payload, list) and payload and isinstance(payload[0], dict):
         first = payload[0]

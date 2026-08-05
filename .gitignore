@@ -216,3 +216,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Sample agents LLM config — never commit credentials.
+# `config.example.yaml` is tracked (no real keys); `config.yaml` is local-only.
+sample_agents/config.yaml
+sample_agents/config.*.yaml
+!sample_agents/config.example.yaml
+.env.sample_agents

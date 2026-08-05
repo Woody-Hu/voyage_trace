@@ -12,6 +12,7 @@
 - **确定性回放与假设模拟** — 使用记录的 I/O 作为磁带回放追踪；在应用修改（模型替换、循环上限、节点删除）前投影其效果。
 - **可插拔工作区存储** — `WorkspaceStorage` 抽象基类，提供真实内存后端和生产级 Postgres 后端（`psycopg` v3 + 异步连接池）。
 - **分区记忆系统** — 四类记忆分区（情景、语义、程序、工作），按目标智能体 + 治理轮次隔离，支持动态插拔与跨轮次召回。
+- **闭环校验** — 在方案部署后，部署后 trace 被重新采集，每个方案的*投影*节省与*实际兑现*的节省配对（真实图算术，绝不使用仿真器自身的输出）。差距折入按智能体的校准乘子 `τ = Σactual / Σprojected`，下一轮治理把它应用于其原始投影。当 `τ = None`（冷启动）时系统行为与之前完全一致。
 - **deepagents 原生** — 仅通过 deepagents 公共扩展点（`BackendProtocol`、中间件、工具、子智能体）进行扩展，不 vendor 或 fork 内部代码。
 
 ## 安装
@@ -151,6 +152,7 @@ src/voyage_trace/
 ├── adapters/             # 源协议适配器（LangSmith, Langfuse, OTel, A2A, MCP, raw）
 ├── execution_graph.py    # Markdown 执行图（构建, 聚合, 渲染, 解析）
 ├── simulator.py          # 确定性回放 + 假设模拟
+├── verification.py       # 闭环校验：投影 vs 实际节省 → 校准乘子 τ
 ├── storage/              # 工作区存储（抽象基类, 内存, Postgres, BackendProtocol 桥接）
 └── memory/               # 四类分区记忆 + 管理器
 ```

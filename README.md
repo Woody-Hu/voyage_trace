@@ -12,6 +12,7 @@ A meta-agent that collects other agents' execution traces and produces governanc
 - **Deterministic replay & what-if simulation** — Replay recorded traces using their own I/O as cassette; project the effect of modifications (model swap, loop caps, node removal) before applying them.
 - **Pluggable workspace storage** — `WorkspaceStorage` ABC with a real in-memory backend and a production Postgres backend (`psycopg` v3 + async connection pool).
 - **Partitioned memory system** — Four memory partitions (episodic, semantic, procedural, working) scoped per target-agent + governance round, with dynamic plug/unplug and cross-round recall.
+- **Closed-loop verification** — After a plan is deployed, post-deployment traces are re-ingested and each proposal's *projected* savings are paired with the savings that *materialised* (real graph arithmetic, never the simulator's own output). The gap is folded into a per-agent calibration multiplier `τ = Σactual / Σprojected` that the next governance round applies to its raw projections. With `τ = None` (cold start) the system behaves exactly as before.
 - **deepagents-native** — Extends deepagents only through its public seams (`BackendProtocol`, middleware, tools, sub-agents). No vendoring or forking.
 
 ## Installation
@@ -151,6 +152,7 @@ src/voyage_trace/
 ├── adapters/             # Source-protocol adapters (LangSmith, Langfuse, OTel, A2A, MCP, raw)
 ├── execution_graph.py    # Markdown execution graph (build, aggregate, render, parse)
 ├── simulator.py          # Deterministic replay + what-if simulation
+├── verification.py       # Closed-loop verification: projected vs actual savings → calibration τ
 ├── storage/              # Workspace storage (ABC, in-memory, Postgres, BackendProtocol bridge)
 └── memory/               # Four partitioned memory stores + manager
 ```

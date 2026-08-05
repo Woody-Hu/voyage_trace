@@ -63,6 +63,7 @@ class AnalysisStepKind(str, Enum):
     DECIDE = "decide"          # accepted / rejected a proposal
     REMEMBER = "remember"      # persisted a finding/rule/template to memory
     RECALL = "recall"          # recalled a past finding/rule from memory
+    VERIFY = "verify"          # verified projected savings vs post-deployment actuals
 
 
 class ProposalDecision(str, Enum):
@@ -132,6 +133,22 @@ class OptimizationProposal:
     :func:`~voyage_trace.simulator.project_savings`) that validate it. The
     governance agent turns a set of proposals into a
     :class:`GovernancePlan` by accepting/rejecting each.
+
+    Two savings dicts are carried separately so the closed loop is auditable:
+
+    * ``expected_savings`` — the simulator's *raw* projection (filled by the
+      :class:`~voyage_trace.agents.SimulationAgent`). This is what the
+      simulator said *would* happen.
+    * ``actual_savings`` — the *observed* savings after the plan was deployed
+      (filled by :class:`~voyage_trace.agents.VerificationAgent` via
+      :func:`~voyage_trace.verification.verify_plan`). Empty until a
+      post-deployment trace is verified. This is what *did* happen.
+
+    The gap between the two is the projection error that
+    :class:`~voyage_trace.verification.CalibrationState` learns from.
+    ``calibration_applied`` records the multiplier ``τ`` governance used when
+    deciding (``None`` = cold start / uncalibrated), so a reviewer can always
+    tell whether an accept/reject was made on a raw or a calibrated projection.
     """
 
     modification: Modification
@@ -143,6 +160,14 @@ class OptimizationProposal:
     validation_notes: str = ""
     decision: ProposalDecision | None = None
     decision_rationale: str = ""
+    # Populated by the governance agent when a calibration multiplier τ was
+    # applied to the raw projection before the accept/reject decision.
+    # None = cold start (raw projection used); a float = τ that was applied.
+    calibration_applied: float | None = None
+    # Populated by the verification agent after a post-deployment trace is
+    # compared to the before-graph. Empty until verified.
+    actual_savings: dict[str, float] = field(default_factory=dict)
+    verified: bool = False
 
     def accept(self, rationale: str = "") -> None:
         self.decision = ProposalDecision.ACCEPTED
@@ -163,6 +188,16 @@ class GovernancePlan:
     plus a human-readable summary and the headline metrics the governance
     agent wants the target agent's operator to see. It is what gets
     persisted under the ``governance_plans`` storage namespace.
+
+    Two headline savings totals are exposed so the closed loop is visible at
+    the plan level, not just per proposal:
+
+    * :attr:`total_projected_savings_usd` — sum of the simulator's raw
+      projections over accepted proposals (what was promised).
+    * :attr:`total_actual_savings_usd` — sum of the observed savings over
+      verified accepted proposals (what materialised). Stays 0.0 until a
+      :class:`~voyage_trace.agents.VerificationAgent` has run against a
+      post-deployment trace.
     """
 
     target_agent_id: str
@@ -175,6 +210,13 @@ class GovernancePlan:
     metrics: dict[str, Any] = field(default_factory=dict)
     # Reference to the AnalysisRecord that produced this plan.
     analysis_record_id: str = ""
+    # The calibration multiplier τ governance used for this round's
+    # accept/reject decisions (None = cold start / raw projection). Recorded
+    # so a reviewer can tell whether the plan's projections were calibrated.
+    calibration_applied: float | None = None
+    # Reference to the VerificationResult that verified this plan against
+    # post-deployment actuals ("" until verified).
+    verification_id: str = ""
 
     @property
     def accepted_count(self) -> int:
@@ -187,6 +229,24 @@ class GovernancePlan:
             for p in self.accepted_proposals
             if p.expected_savings
         )
+
+    @property
+    def total_actual_savings_usd(self) -> float:
+        """Sum of observed savings over verified accepted proposals.
+
+        Unverified proposals contribute 0.0 (no reality measured yet), so
+        this property stays at 0.0 until a verification round has populated
+        each proposal's ``actual_savings``.
+        """
+        return sum(
+            p.actual_savings.get("cost_delta_usd", 0.0)
+            for p in self.accepted_proposals
+            if p.verified and p.actual_savings
+        )
+
+    @property
+    def verified_count(self) -> int:
+        return sum(1 for p in self.accepted_proposals if p.verified)
 
 
 @dataclass
@@ -298,6 +358,9 @@ def proposal_to_dict(p: OptimizationProposal) -> dict[str, Any]:
         "validation_notes": p.validation_notes,
         "decision": p.decision.value if p.decision else None,
         "decision_rationale": p.decision_rationale,
+        "calibration_applied": p.calibration_applied,
+        "actual_savings": p.actual_savings,
+        "verified": p.verified,
     }
 
 
@@ -311,6 +374,9 @@ def proposal_from_dict(d: dict[str, Any]) -> OptimizationProposal:
         validated=bool(d.get("validated", False)),
         validation_notes=d.get("validation_notes", ""),
         decision_rationale=d.get("decision_rationale", ""),
+        calibration_applied=d.get("calibration_applied"),
+        actual_savings=d.get("actual_savings") or {},
+        verified=bool(d.get("verified", False)),
     )
     dec = d.get("decision")
     if dec:
@@ -329,6 +395,8 @@ def plan_to_dict(plan: GovernancePlan) -> dict[str, Any]:
         "rejected_proposals": [proposal_to_dict(p) for p in plan.rejected_proposals],
         "metrics": plan.metrics,
         "analysis_record_id": plan.analysis_record_id,
+        "calibration_applied": plan.calibration_applied,
+        "verification_id": plan.verification_id,
     }
 
 
@@ -341,6 +409,8 @@ def plan_from_dict(d: dict[str, Any]) -> GovernancePlan:
         created_at=_dt_from_str(d.get("created_at")) or _utcnow(),
         metrics=d.get("metrics") or {},
         analysis_record_id=d.get("analysis_record_id", ""),
+        calibration_applied=d.get("calibration_applied"),
+        verification_id=d.get("verification_id", ""),
     )
     plan.accepted_proposals = [proposal_from_dict(p) for p in d.get("accepted_proposals", [])]
     plan.rejected_proposals = [proposal_from_dict(p) for p in d.get("rejected_proposals", [])]
@@ -454,15 +524,17 @@ def render_analysis_markdown(record: AnalysisRecord) -> str:
 
     lines.append("## Proposals")
     if record.proposals:
-        lines.append("| id | target | kind | validated | decision | saving($) | rationale |")
-        lines.append("|---|---|---|---|---|---|---|")
+        lines.append("| id | target | kind | validated | decision | projected($) | actual($) | rationale |")
+        lines.append("|---|---|---|---|---|---|---|---|")
         for p in record.proposals:
             dec = p.decision.value if p.decision else "—"
             sav = p.expected_savings.get("cost_delta_usd", 0.0)
+            act = p.actual_savings.get("cost_delta_usd", 0.0) if p.verified else None
+            act_str = f"{act:.6f}" if act is not None else "—"
             rat = (p.rationale or "").replace("|", "/").replace("\n", " ")
             lines.append(
                 f"| {p.proposal_id} | {p.modification.target_node_id} | "
-                f"{p.modification.kind} | {p.validated} | {dec} | {sav:.6f} | {rat} |"
+                f"{p.modification.kind} | {p.validated} | {dec} | {sav:.6f} | {act_str} | {rat} |"
             )
     else:
         lines.append("- (no proposals)")
@@ -475,6 +547,17 @@ def render_analysis_markdown(record: AnalysisRecord) -> str:
         lines.append(f"- accepted: {plan.accepted_count}")
         lines.append(f"- rejected: {len(plan.rejected_proposals)}")
         lines.append(f"- total_projected_savings_usd: {plan.total_projected_savings_usd:.6f}")
+        # Closed-loop fields. total_actual_savings_usd stays 0.0 until a
+        # verification round has populated actual_savings on accepted proposals.
+        if plan.verified_count > 0:
+            lines.append(
+                f"- total_actual_savings_usd: {plan.total_actual_savings_usd:.6f} "
+                f"(verified: {plan.verified_count}/{plan.accepted_count})"
+            )
+        tau_str = "cold-start (raw projection)" if plan.calibration_applied is None else f"{plan.calibration_applied:.4f}"
+        lines.append(f"- calibration_applied: {tau_str}")
+        if plan.verification_id:
+            lines.append(f"- verification_id: {plan.verification_id}")
         if plan.metrics:
             lines.append("- metrics:")
             for k, v in plan.metrics.items():

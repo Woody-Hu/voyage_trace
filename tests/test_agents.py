@@ -359,8 +359,12 @@ class TestOrchestrator:
         record, plan = await Orchestrator().run(
             three_payloads, target_agent_id="agent-A", round_id="round-1", memory=pm,
         )
-        # governance did recall + remember
-        assert record.step_count(AnalysisStepKind.RECALL) == 1
+        # Two RECALL steps in a closed-loop round: (1) the orchestrator
+        # recalls the per-agent calibration τ from semantic memory (cold
+        # start here -> a RECALL step is still recorded), and (2) the
+        # governance agent recalls past governance outcomes. One REMEMBER
+        # step persists the round outcome to episodic memory.
+        assert record.step_count(AnalysisStepKind.RECALL) == 2
         assert record.step_count(AnalysisStepKind.REMEMBER) == 1
         # cross-round recall now returns the persisted outcome
         hits = await pm.recall_cross_round("agent-A", "governance:outcome")

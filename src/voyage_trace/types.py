@@ -76,6 +76,10 @@ class SourceProtocol(str, Enum):
     OTEL = "otel"
     HELICONE = "helicone"
     AGENTOPS = "agentops"
+    # Pull-side score / eval formats (no SDK required to ingest; the richer
+    # SDK-using push/pull helpers live in :mod:`voyage_trace.integrations`).
+    DEEPEVAL = "deepeval"
+    ACS = "acs"
     CUSTOM = "custom"
 
 

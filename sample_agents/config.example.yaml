@@ -1,0 +1,39 @@
+# Sample-agents LLM configuration.
+#
+# Copy this file to `config.yaml` (in the same directory) and fill in the
+# `api_key` field, OR — preferred — leave `api_key` blank and export the
+# env var named in `api_key_env` (default: DEEPSEEK_API_KEY).
+#
+# `config.yaml` is git-ignored; never commit a real key. The example file
+# ships with no credentials and the source code never hardcodes one.
+
+default:
+  provider: deepseek
+  model: deepseek-v4-flash            # DeepSeek V4 Flash (fast, cheap, chat)
+  base_url: https://api.deepseek.com
+  # Leave `api_key` empty — read it from the env var below instead.
+  api_key:
+  api_key_env: DEEPSEEK_API_KEY
+  temperature: 0.2
+
+# Per-agent overrides. Any key not present here falls back to `default`.
+research_agent:
+  provider: deepseek
+  model: deepseek-v4-flash
+  base_url: https://api.deepseek.com
+  api_key_env: DEEPSEEK_API_KEY
+  temperature: 0.0                    # research wants deterministic output
+
+code_review_agent:
+  provider: deepseek
+  model: deepseek-v4-flash
+  base_url: https://api.deepseek.com
+  api_key_env: DEEPSEEK_API_KEY
+  temperature: 0.1
+
+kb_qa_agent:
+  provider: deepseek
+  model: deepseek-v4-flash
+  base_url: https://api.deepseek.com
+  api_key_env: DEEPSEEK_API_KEY
+  temperature: 0.2

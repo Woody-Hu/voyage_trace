@@ -7,7 +7,7 @@
 ## 特性
 
 - **后端无关的追踪协议** — 统一的 `CanonicalTrace` / `TraceSpan` 规范模式，将任意可观测性后端的追踪数据标准化。
-- **六种源适配器** — 内置支持 LangSmith、Langfuse、OpenTelemetry GenAI、A2A、MCP 以及原始/半结构化数据。
+- **八种源适配器** — 内置支持 LangSmith、Langfuse、OpenTelemetry GenAI、A2A、MCP、原始/半结构化数据、DeepEval 指标结果以及 ACS 安全/一致性裁决。（`HELICONE` 与 `AGENTOPS` 为保留枚举值，暂未实现适配器。）
 - **Markdown 执行图** — 从追踪数据生成 Git 可 diff、GitHub 可原生渲染的执行图（YAML 前置元数据 + Mermaid `flowchart TD` + 节点统计表）。
 - **确定性回放与假设模拟** — 使用记录的 I/O 作为磁带回放追踪；在应用修改（模型替换、循环上限、节点删除）前投影其效果。
 - **可插拔工作区存储** — `WorkspaceStorage` 抽象基类，提供真实内存后端和生产级 Postgres 后端（`psycopg` v3 + 异步连接池）。
@@ -149,10 +149,15 @@ storage = PostgresStorage(
 src/voyage_trace/
 ├── types.py              # 核心领域类型（TraceSpan, CanonicalTrace, 枚举）
 ├── protocol.py           # JSON 序列化, dotted_order, 不变量强制校验
-├── adapters/             # 源协议适配器（LangSmith, Langfuse, OTel, A2A, MCP, raw）
+├── _internal.py          # 共享私有助手（utcnow, new_id, dt<->str）
+├── adapters/             # 源协议适配器（LangSmith, Langfuse, OTel, A2A, MCP, raw, DeepEval, ACS）
 ├── execution_graph.py    # Markdown 执行图（构建, 聚合, 渲染, 解析）
 ├── simulator.py          # 确定性回放 + 假设模拟
+├── analysis.py           # 元智能体轨迹记录（AnalysisStep / GovernancePlan / AnalysisRecord）
+├── automl.py             # 在执行图特征矩阵上的防泄漏 AutoML
 ├── verification.py       # 闭环校验：投影 vs 实际节省 → 校准乘子 τ
+├── agents.py             # 多智能体治理管线 + Orchestrator
+├── integrations/         # 可选 SDK 桥接（DeepEval, Azure Content Safety, Langfuse 导出, FLAML）
 ├── storage/              # 工作区存储（抽象基类, 内存, Postgres, BackendProtocol 桥接）
 └── memory/               # 四类分区记忆 + 管理器
 ```

@@ -9,14 +9,10 @@ DSN is configured and is used by unit tests that don't need Postgres.
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
 from typing import Any
 
+from .._internal import utcnow as _utcnow
 from .base import StorageRecord, WorkspaceStorage
-
-
-def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
 
 
 class InMemoryStorage(WorkspaceStorage):

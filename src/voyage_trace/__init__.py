@@ -12,8 +12,8 @@ Architecture overview (see ``docs/architecture.md`` for the full picture):
 * :mod:`voyage_trace.simulator`
     Deterministic replay + what-if simulation over traces / execution graphs.
 * :mod:`voyage_trace.adapters`
-    Per-source-protocol trace adapters (Langfuse / LangSmith / OTel / A2A /
-    MCP / raw) → canonical schema.
+    Per-source-protocol trace adapters (LangSmith / Langfuse / OTel / A2A /
+    MCP / raw / DeepEval / ACS) → canonical schema.
 * :mod:`voyage_trace.storage`
     Pluggable workspace storage (``WorkspaceStorage`` ABC) with a real
     Postgres backend and an in-memory backend, plus a bridge that exposes
@@ -21,15 +21,24 @@ Architecture overview (see ``docs/architecture.md`` for the full picture):
 * :mod:`voyage_trace.memory`
     Four partitioned memory stores (episodic / semantic / procedural /
     working), scoped per target-agent + round, dynamically pluggable.
-* :mod:`voyage_trace.governance`
-    Standard governance-plan format + finding detectors.
-* :mod:`voyage_trace.middleware` / :mod:`voyage_trace.tools` /
-    :mod:`voyage_trace.agents`
-    deepagents extension points: middleware, plain-callable tools, and
-    declarative sub-agents.
-* :mod:`voyage_trace.factory`
-    ``create_voyage_trace_agent()`` — assembles everything into one
-    deepagents-powered agent via the public extension seams only.
+* :mod:`voyage_trace.analysis`
+    Internal data format for the meta-agent's own trajectory
+    (``AnalysisStep`` / ``OptimizationProposal`` / ``GovernancePlan`` /
+    ``AnalysisRecord``) — the diffable record of how a governance round was
+    produced.
+* :mod:`voyage_trace.automl`
+    Leakage-safe AutoML over the execution-graph feature matrix; wraps
+    AutoGluon (default) and exposes a FLAML alternative via
+    :mod:`voyage_trace.integrations.flaml_runner`.
+* :mod:`voyage_trace.verification`
+    Closed-loop verification: pairs projected savings with post-deployment
+    actuals and folds the gap into a per-agent calibration multiplier ``τ``.
+* :mod:`voyage_trace.agents`
+    The multi-agent governance pipeline (Ingest / Modeling / Simulation /
+    Governance / Verification + Orchestrator) that ties the above together.
+* :mod:`voyage_trace.integrations`
+    Optional, lazily-imported SDK bridges (DeepEval, Azure Content Safety,
+    Langfuse push-side export, FLAML AutoML backend).
 """
 
 from __future__ import annotations

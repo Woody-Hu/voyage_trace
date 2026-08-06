@@ -85,7 +85,7 @@ from .execution_graph import (
     render_markdown,
 )
 from .memory import MemoryScope
-from .simulator import Modification, project_savings, simulate_graph
+from .simulator import project_savings, simulate_graph
 from .types import CanonicalTrace
 from .verification import (
     VERIFICATION_COT_PROMPT,

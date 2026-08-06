@@ -68,23 +68,7 @@ class ProceduralMemory(MemoryPartition):
         instead — ``recall`` only hits when ``key`` is already a
         ``<key>#v<n>`` string (or a non-versioned key).
         """
-        rec = await self.storage.get(self._ns(scope), key)
-        return self._deserialize(rec.value) if rec else None
-
-    async def search(
-        self,
-        scope: MemoryScope,
-        query: dict[str, Any],
-        limit: int = 10,
-    ) -> list[dict[str, Any]]:
-        if scope.target_agent_id == "*" or scope.round_id == "*":
-            records = await self._cross_namespace_search(scope, query, limit)
-        else:
-            records = await self.storage.query(self._ns(scope), query, limit)
-        return [self._deserialize(r.value) for r in records]
-
-    async def forget(self, scope: MemoryScope, key: str) -> bool:
-        return await self.storage.delete(self._ns(scope), key)
+        return await super().recall(scope, key)
 
     async def latest(self, scope: MemoryScope, key: str) -> dict[str, Any] | None:
         """Return the highest-versioned record for ``key``, or ``None``."""

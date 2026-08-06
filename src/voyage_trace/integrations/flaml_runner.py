@@ -42,7 +42,6 @@ from ..automl import (
     FEATURE_NAMES,
     MeanBaseline,
     TrainedModel,
-    extract_feature_matrix,
     feature_matrix_from_graph,
     leakage_safe_features,
 )
@@ -101,12 +100,14 @@ def run_automl_flaml(
     AutoML = _import_flaml()
 
     # --- build feature matrix (same as run_automl) ---------------------- #
+    # Aggregate once: see run_automl for the rationale (avoids re-aggregating
+    # the same traces when both the feature matrix and the per-node
+    # suggestions need the template graph).
     if graph is None:
         if not traces:
             raise ValueError("run_automl_flaml requires either `traces` or `graph`")
-        matrix = extract_feature_matrix(traces)
-    else:
-        matrix = feature_matrix_from_graph(graph)
+        graph = aggregate_execution_graph(traces)
+    matrix = feature_matrix_from_graph(graph)
 
     if target not in matrix.targets:
         raise ValueError(
@@ -125,9 +126,6 @@ def run_automl_flaml(
             f"{target!r}: a feature that equals the target is identity leakage."
         )
 
-    if graph is None:
-        assert traces is not None
-        graph = aggregate_execution_graph(traces)
     n_traces = graph.observed_runs
     if n_traces < min_samples:
         notes.append(
@@ -153,7 +151,7 @@ def run_automl_flaml(
             dataframe=df,
             label=target,
             task="regression",
-            metric=eval_metric if eval_metric != "r2" else "r2",
+            metric=eval_metric,
             time_budget=time_limit,
             verbose=0,
             **fit_kwargs,

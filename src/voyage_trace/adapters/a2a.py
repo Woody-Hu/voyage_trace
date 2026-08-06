@@ -26,11 +26,11 @@ Each status transition becomes one span with
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any
 
 from ..types import CanonicalTrace, OperationType, SourceProtocol, SpanStatus
-from .base import AdapterError, TraceAdapter
+from .base import AdapterError, TraceAdapter, _now
 
 # A2A Task state -> canonical span status.
 _STATE_MAP: dict[str, SpanStatus] = {
@@ -115,7 +115,7 @@ class A2AAdapter(TraceAdapter):
         state = upd.get("state", "unknown")
         status = _STATE_MAP.get(str(state).lower(), SpanStatus.UNKNOWN)
 
-        start = self._parse_dt(upd.get("timestamp")) or datetime.now(timezone.utc)
+        start = self._parse_dt(upd.get("timestamp")) or _now()
         end: datetime | None = None
         if i + 1 < len(seq):
             candidate = self._parse_dt(seq[i + 1].get("timestamp"))

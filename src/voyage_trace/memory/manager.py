@@ -22,7 +22,7 @@ from __future__ import annotations
 from typing import Any
 
 from ..storage.base import WorkspaceStorage
-from .base import MemoryPartition, MemoryScope
+from .base import MemoryScope
 from .episodic import EpisodicMemory
 from .procedural import ProceduralMemory
 from .semantic import SemanticMemory
@@ -44,12 +44,6 @@ class PartitionedMemory:
         self._semantic = SemanticMemory(storage)
         self._procedural = ProceduralMemory(storage)
         self._working = WorkingMemory(storage)
-        self.partitions: dict[str, MemoryPartition] = {
-            "episodic": self._episodic,
-            "semantic": self._semantic,
-            "procedural": self._procedural,
-            "working": self._working,
-        }
         self._scope_stack: list[MemoryScope] = []
         # Configured by .use() for the next with/async-with block.
         self._pending_mount: tuple[str, str] | None = None

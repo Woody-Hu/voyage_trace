@@ -61,7 +61,12 @@ trace 来源的线路协议 / 可观测性后端。`voyage_trace` 是构建在*�
 | `OTEL`        | `otel`       |
 | `HELICONE`    | `helicone`   |
 | `AGENTOPS`    | `agentops`   |
+| `DEEPEVAL`    | `deepeval`   |
+| `ACS`         | `acs`        |
 | `CUSTOM`      | `custom`     |
+
+`HELICONE` 与 `AGENTOPS` 为保留枚举值 —— 暂未实现对应的 adapter。
+其余八个成员各对应一个具体的 `TraceAdapter` 子类。
 
 #### `TaskLifecycleState`
 

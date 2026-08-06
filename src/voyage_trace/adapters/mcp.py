@@ -30,11 +30,10 @@ Mapping rules
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from typing import Any
 
 from ..types import CanonicalTrace, OperationType, SourceProtocol, SpanStatus
-from .base import AdapterError, TraceAdapter
+from .base import AdapterError, TraceAdapter, _now, _otel_status_code
 
 
 class MCPAdapter(TraceAdapter):
@@ -121,7 +120,7 @@ class MCPAdapter(TraceAdapter):
             or (response.get("timestamp") if response else None)
         )
 
-        start = request_ts or datetime.now(timezone.utc)
+        start = request_ts or _now()
         end = response_ts or self._parse_dt(meta.get("end_time"))
         if end is not None and end < start:
             end = None
@@ -184,11 +183,7 @@ class MCPAdapter(TraceAdapter):
 
             status_obj = sp.get("status") or {}
             code = status_obj.get("code") if isinstance(status_obj, dict) else status_obj
-            code_s = str(code).upper()
-            if code_s in ("ERROR", "2") or code == 2:
-                status = SpanStatus.FAILED
-            else:
-                status = SpanStatus.SUCCESS
+            status = _otel_status_code(code)
             err_msg = status_obj.get("message") if isinstance(status_obj, dict) else None
 
             server = attrs.get("mcp.server.name", "") or "mcp-server"

@@ -85,7 +85,9 @@ for span in trace.sorted_spans():
 ```
 
 Supported `SourceProtocol` values: `A2A`, `MCP`, `LANGFUSE`, `LANGSMITH`,
-`OTEL`, `HELICONE`, `AGENTOPS`, `CUSTOM`.
+`OTEL`, `HELICONE`, `AGENTOPS`, `DEEPEVAL`, `ACS`, `CUSTOM`. Of these,
+`HELICONE` and `AGENTOPS` are reserved vocabulary with no adapter yet; the
+other eight each have a concrete adapter in `voyage_trace.adapters`.
 
 ---
 

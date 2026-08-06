@@ -55,10 +55,6 @@ class SemanticMemory(MemoryPartition):
             md.update(metadata)
         await self.storage.put(self._ns(scope), key, self._serialize(value), md)
 
-    async def recall(self, scope: MemoryScope, key: str) -> dict[str, Any] | None:
-        rec = await self.storage.get(self._ns(scope), key)
-        return self._deserialize(rec.value) if rec else None
-
     async def search(
         self,
         scope: MemoryScope,
@@ -71,13 +67,10 @@ class SemanticMemory(MemoryPartition):
         confidence_min = q.pop("confidence_min", None)
         confidence_max = q.pop("confidence_max", None)
 
-        # Over-fetch a little so the in-memory threshold filter still has
-        # enough candidates to fill ``limit``.
-        fetch_limit = max(limit * 3, limit)
-        if scope.target_agent_id == "*" or scope.round_id == "*":
-            records = await self._cross_namespace_search(scope, q, fetch_limit)
-        else:
-            records = await self.storage.query(self._ns(scope), q, fetch_limit)
+        # Over-fetch 3x so the in-memory threshold filter still has enough
+        # candidates left to fill ``limit`` after filtering.
+        fetch_limit = limit * 3
+        records = await self._query_records(scope, q, fetch_limit)
 
         results = [self._deserialize(r.value) for r in records]
         if confidence_min is not None:
@@ -85,6 +78,3 @@ class SemanticMemory(MemoryPartition):
         if confidence_max is not None:
             results = [r for r in results if r.get("confidence", 0.0) <= confidence_max]
         return results[:limit]
-
-    async def forget(self, scope: MemoryScope, key: str) -> bool:
-        return await self.storage.delete(self._ns(scope), key)

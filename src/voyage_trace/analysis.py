@@ -29,23 +29,16 @@ produced.
 from __future__ import annotations
 
 import json
-import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime
 from enum import Enum
 from typing import Any
 
 import yaml
 
+from ._internal import dt_from_str as _dt_from_str, dt_to_str as _dt_to_str
+from ._internal import new_id as _new_id, utcnow as _utcnow
 from .simulator import Modification, modification_to_dict, modification_from_dict
-
-
-def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def _new_id(prefix: str) -> str:
-    return f"{prefix}-{uuid.uuid4().hex[:12]}"
 
 
 class AnalysisStepKind(str, Enum):
@@ -304,18 +297,6 @@ class AnalysisRecord:
 # --------------------------------------------------------------------------- #
 # JSON serialisation (mirrors protocol.py's style)
 # --------------------------------------------------------------------------- #
-def _dt_to_str(dt: datetime | None) -> str | None:
-    if dt is None:
-        return None
-    return dt.isoformat()
-
-
-def _dt_from_str(s: str | None) -> datetime | None:
-    if not s:
-        return None
-    return datetime.fromisoformat(s.replace("Z", "+00:00"))
-
-
 def step_to_dict(step: AnalysisStep) -> dict[str, Any]:
     return {
         "step_id": step.step_id,

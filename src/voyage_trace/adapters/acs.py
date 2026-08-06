@@ -34,11 +34,10 @@ Mapping
 
 from __future__ import annotations
 
-import uuid
 from typing import Any
 
 from ..types import CanonicalTrace, OperationType, SourceProtocol, SpanStatus, TraceSpan
-from .base import TraceAdapter
+from .base import AdapterError, TraceAdapter, _synthetic_id
 
 
 class ACSAdapter(TraceAdapter):
@@ -49,9 +48,9 @@ class ACSAdapter(TraceAdapter):
     def adapt(self, payload: "dict | list | str | bytes") -> CanonicalTrace:
         data = self._decode(payload)
         if not isinstance(data, dict):
-            raise ValueError("acs payload must be a dict")
+            raise AdapterError("acs payload must be a dict")
 
-        trace_id = data.get("trace_id") or f"acs-{uuid.uuid4().hex[:8]}"
+        trace_id = data.get("trace_id") or _synthetic_id("acs")
         agent_id = data.get("agent_id") or "acs"
         verdict = data.get("verdict", "unknown")
         scores = list(data.get("scores") or [])

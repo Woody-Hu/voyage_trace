@@ -54,7 +54,7 @@ protocol layer can be used standalone.
 |---|---|---|
 | `OperationType` | `str, Enum` | Canonical operation types, aligned with OpenTelemetry GenAI semantic conventions (`gen_ai.operation.name`). Members: `INVOKE_AGENT`, `CHAT`, `EXECUTE_TOOL`, `RETRIEVAL`, `EMBEDDING`, `HANDOFF`. |
 | `SpanStatus` | `str, Enum` | Lifecycle status of a single span. First five values mirror the A2A Task lifecycle. Members: `SUBMITTED`, `WORKING`, `INPUT_REQUIRED`, `COMPLETED`, `FAILED`, `CANCELED`, `SUCCESS`, `ERROR`, `PENDING`, `UNKNOWN`. |
-| `SourceProtocol` | `str, Enum` | The wire protocol / observability backend a trace arrived from. Members: `A2A`, `MCP`, `LANGFUSE`, `LANGSMITH`, `OTEL`, `HELICONE`, `AGENTOPS`, `CUSTOM`. |
+| `SourceProtocol` | `str, Enum` | The wire protocol / observability backend a trace arrived from. Members: `A2A`, `MCP`, `LANGFUSE`, `LANGSMITH`, `OTEL`, `HELICONE` (reserved), `AGENTOPS` (reserved), `DEEPEVAL`, `ACS`, `CUSTOM`. The first eight (excluding the two reserved) each map to a concrete `TraceAdapter` subclass. |
 | `TaskLifecycleState` | `str, Enum` | A2A v1.0 Task lifecycle states, reused as a "stuck-state" taxonomy for classifying where an observed agent stopped making progress. |
 | `TraceSpan` | `@dataclass` | The atomic unit of the protocol — one backend-agnostic observation of one agent step. |
 | `CanonicalTrace` | `@dataclass` | A full observed agent run, normalised to the voyage_trace protocol. |
@@ -134,6 +134,8 @@ they parse exported JSON, never call a backend SDK.
 | `adapters/mcp.py` | `MCPAdapter` | Dual-path: JSON-RPC messages, or OTel MCP spans. Maps methods to operations (`tools/*` -> `execute_tool`, `resources/*` -> `retrieval`, `prompts/*` -> `chat`). |
 | `adapters/otel.py` | `OTELAdapter` | Converts OTel GenAI spans; maps `gen_ai.*` attributes; supports the OTLP `resourceSpans` tree. |
 | `adapters/raw.py` | `RawAdapter` | Fallback adapter for canonical / semi-structured payloads; aliases `id` -> `span_id`. |
+| `adapters/deepeval.py` | `DeepEvalAdapter` | Pull-side adapter for DeepEval metric results — one score span per metric (`is_successful` -> `SpanStatus.SUCCESS/FAILED`). SDK-free; the bidirectional DeepEval helpers live in `integrations/deepeval.py`. |
+| `adapters/acs.py` | `ACSAdapter` | Pull-side adapter for safety/consistency verdict dicts (`{verdict, scores: [...]}`) — one span per category. Treats "ACS" generically (Azure Content Safety or any verdict-shaped service); the SDK-using Azure scorer lives in `integrations/acs.py`. |
 
 Entry point:
 

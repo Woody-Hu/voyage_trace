@@ -66,7 +66,13 @@ onto the canonical `TraceSpan`.
 | `OTEL`       | `otel`       |
 | `HELICONE`   | `helicone`   |
 | `AGENTOPS`   | `agentops`   |
+| `DEEPEVAL`   | `deepeval`   |
+| `ACS`        | `acs`        |
 | `CUSTOM`     | `custom`     |
+
+`HELICONE` and `AGENTOPS` are reserved vocabulary — no adapter is
+implemented for them yet. The other eight each map to a concrete
+:class:`~voyage_trace.adapters.TraceAdapter` subclass.
 
 #### `TaskLifecycleState`
 

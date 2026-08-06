@@ -7,7 +7,7 @@ A meta-agent that collects other agents' execution traces and produces governanc
 ## Features
 
 - **Backend-agnostic trace protocol** — A canonical `CanonicalTrace` / `TraceSpan` schema that normalizes traces from any observability backend.
-- **Six source adapters** — Built-in support for LangSmith, Langfuse, OpenTelemetry GenAI, A2A, MCP, and raw/semi-structured payloads.
+- **Eight source adapters** — Built-in support for LangSmith, Langfuse, OpenTelemetry GenAI, A2A, MCP, raw/semi-structured payloads, DeepEval metric results, and ACS safety/consistency verdicts. (`HELICONE` and `AGENTOPS` are reserved vocabulary — no adapter yet.)
 - **Markdown execution graphs** — Derive Git-diffable, GitHub-renderable execution graphs (YAML front-matter + Mermaid `flowchart TD` + node-stats table) from traces.
 - **Deterministic replay & what-if simulation** — Replay recorded traces using their own I/O as cassette; project the effect of modifications (model swap, loop caps, node removal) before applying them.
 - **Pluggable workspace storage** — `WorkspaceStorage` ABC with a real in-memory backend and a production Postgres backend (`psycopg` v3 + async connection pool).
@@ -149,10 +149,15 @@ storage = PostgresStorage(
 src/voyage_trace/
 ├── types.py              # Core domain types (TraceSpan, CanonicalTrace, enums)
 ├── protocol.py           # JSON serialization, dotted_order, invariant enforcement
-├── adapters/             # Source-protocol adapters (LangSmith, Langfuse, OTel, A2A, MCP, raw)
+├── _internal.py          # Shared private helpers (utcnow, new_id, dt<->str)
+├── adapters/             # Source-protocol adapters (LangSmith, Langfuse, OTel, A2A, MCP, raw, DeepEval, ACS)
 ├── execution_graph.py    # Markdown execution graph (build, aggregate, render, parse)
 ├── simulator.py          # Deterministic replay + what-if simulation
+├── analysis.py           # Meta-agent trajectory record (AnalysisStep / GovernancePlan / AnalysisRecord)
+├── automl.py             # Leakage-safe AutoML over the execution-graph feature matrix
 ├── verification.py       # Closed-loop verification: projected vs actual savings → calibration τ
+├── agents.py             # Multi-agent governance pipeline + Orchestrator
+├── integrations/         # Optional SDK bridges (DeepEval, Azure Content Safety, Langfuse export, FLAML)
 ├── storage/              # Workspace storage (ABC, in-memory, Postgres, BackendProtocol bridge)
 └── memory/               # Four partitioned memory stores + manager
 ```

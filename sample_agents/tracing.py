@@ -103,6 +103,21 @@ def _tool_call_status(result: Any) -> tuple[SpanStatus, str | None]:
     return SpanStatus.SUCCESS, None
 
 
+def _model_name(model: Any) -> str:
+    """Best-effort model identifier extraction across LangChain model shapes.
+
+    LangChain chat models expose the model identifier as ``model_name`` or
+    ``model`` (newer versions), not ``.name`` (which is often the class name
+    or empty). Reading only ``.name`` collapsed every chat span into a single
+    ``chat:chat`` node in the aggregated graph, starving AutoML of rows.
+    """
+    for attr in ("model_name", "model", "name"):
+        val = getattr(model, attr, None)
+        if isinstance(val, str) and val:
+            return val
+    return ""
+
+
 class TraceObserver(AgentMiddleware):
     """A no-op deepagents middleware that captures one :class:`CanonicalTrace`.
 
@@ -260,7 +275,7 @@ class TraceObserver(AgentMiddleware):
     ) -> None:
         last_ai = _last_ai_message(getattr(response, "result", None))
         in_tok, out_tok = _extract_usage(last_ai) if last_ai else (0, 0)
-        model_name = getattr(getattr(request, "model", None), "name", "") or ""
+        model_name = _model_name(getattr(request, "model", None))
         # Truncate inputs to the last user message — full transcripts make
         # the trace huge without adding analytical value (we already have
         # the graph for the call sequence).
@@ -294,7 +309,15 @@ class TraceObserver(AgentMiddleware):
             outputs=outputs_snapshot,
             input_tokens=in_tok,
             output_tokens=out_tok,
-            metadata={"model": model_name, "kind": "deepagents.model_call"},
+            # ``name`` aligns with the convention every adapter / synthetic
+            # trace uses (``metadata["name"]``); ``aggregate_execution_graph``
+            # buckets nodes by it, so without it every chat span collapses
+            # into one node and AutoML loses all signal.
+            metadata={
+                "name": model_name or "chat",
+                "model": model_name,
+                "kind": "deepagents.model_call",
+            },
             source_protocol=self.source_protocol,
         )
         self._spans.append(span)
@@ -346,7 +369,15 @@ class TraceObserver(AgentMiddleware):
             inputs={"name": name, "args": args, "tool_call_id": tool_call_id},
             outputs=outputs_snapshot,
             error=err,
-            metadata={"tool": name, "kind": "deepagents.tool_call"},
+            # ``name`` aligns with the convention every adapter / synthetic
+            # trace uses; ``aggregate_execution_graph`` buckets nodes by it.
+            # ``tool`` is kept for backwards compatibility with existing
+            # tests that assert ``metadata["tool"]``.
+            metadata={
+                "name": name,
+                "tool": name,
+                "kind": "deepagents.tool_call",
+            },
             source_protocol=self.source_protocol,
         )
         self._spans.append(span)

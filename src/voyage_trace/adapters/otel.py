@@ -25,7 +25,7 @@ from __future__ import annotations
 from typing import Any
 
 from ..types import CanonicalTrace, OperationType, SourceProtocol, SpanStatus
-from .base import AdapterError, TraceAdapter
+from .base import AdapterError, TraceAdapter, _otel_status_code
 
 # gen_ai.operation.name -> canonical operation type.
 _OP_NAME_MAP: dict[str, OperationType] = {
@@ -157,10 +157,7 @@ class OTELAdapter(TraceAdapter):
             code = status.get("code")
         else:
             code = status
-        code_s = str(code).upper()
-        # OTel status codes: 1 = OK, 2 = ERROR; exporters may use names too.
-        if code_s in ("ERROR", "2") or code == 2:
-            return SpanStatus.FAILED
-        if code_s in ("OK", "1") or code == 1:
-            return SpanStatus.SUCCESS
-        return SpanStatus.SUCCESS
+        # OTel status codes: 1 / "OK" -> SUCCESS, 2 / "ERROR" -> FAILED;
+        # unknown codes default to SUCCESS (matching the OTel "unset" -> not
+        # an error convention). See :func:`._otel_status_code` for the table.
+        return _otel_status_code(code)

@@ -80,7 +80,9 @@ for span in trace.sorted_spans():
 ```
 
 支持的 `SourceProtocol` 取值：`A2A`、`MCP`、`LANGFUSE`、`LANGSMITH`、
-`OTEL`、`HELICONE`、`AGENTOPS`、`CUSTOM`。
+`OTEL`、`HELICONE`、`AGENTOPS`、`DEEPEVAL`、`ACS`、`CUSTOM`。其中
+`HELICONE` 与 `AGENTOPS` 为保留枚举值，暂无适配器；其余八个在
+`voyage_trace.adapters` 中各对应一个具体适配器。
 
 ---
 

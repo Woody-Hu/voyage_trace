@@ -70,10 +70,6 @@ FEATURE_NAMES: tuple[str, ...] = (
     "error_rate",
 )
 
-# Supported regression targets (per-node). ``cost_usd`` is the default
-# governance target; ``error_rate`` is also useful (predict fragility).
-TARGETS: tuple[str, ...] = ("cost_usd", "total_tokens", "total_duration_s")
-
 # Hard leakage map: a feature that IS the target, or a deterministic
 # transform of it, would let AutoGluon "win" by identity rather than by
 # learning. Predicting ``total_tokens`` from a ``total_tokens`` feature is a
@@ -355,12 +351,15 @@ def run_automl(
     import pandas as pd
 
     # --- build feature matrix -------------------------------------------- #
+    # Aggregate once: callers without a graph pass raw traces; we build the
+    # template graph here and reuse it for both the feature matrix and the
+    # per-node suggestions further down. Aggregation is deterministic, so
+    # previously this re-aggregated the same traces twice.
     if graph is None:
         if not traces:
             raise ValueError("run_automl requires either `traces` or `graph`")
-        matrix = extract_feature_matrix(traces)
-    else:
-        matrix = feature_matrix_from_graph(graph)
+        graph = aggregate_execution_graph(traces)
+    matrix = feature_matrix_from_graph(graph)
 
     if target not in matrix.targets:
         raise ValueError(
@@ -383,10 +382,6 @@ def run_automl(
     if soft:
         notes.append(f"Soft-leakage caveat: {soft}")
 
-    # Re-aggregate to get per-node cost/error for suggestions + trace count.
-    if graph is None:
-        assert traces is not None
-        graph = aggregate_execution_graph(traces)
     n_traces = graph.observed_runs
     if n_traces < min_samples:
         notes.append(

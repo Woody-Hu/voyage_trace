@@ -228,6 +228,40 @@ class TestResearchAgent:
         assert "chat" in op_kinds
         assert "execute_tool" in op_kinds
 
+    def test_observer_spans_aggregate_to_distinct_per_tool_nodes(self, scripted_model):
+        """Regression: the observer must populate ``metadata["name"]`` so
+        ``aggregate_execution_graph`` buckets each tool into its own node.
+
+        Before the fix the observer wrote only ``metadata["tool"]`` while the
+        aggregator reads ``metadata["name"]``; every tool span collapsed into
+        a single ``execute_tool:execute_tool`` node, starving AutoML of rows.
+        The same bug affected chat spans: the observer read ``.name`` (often
+        empty) instead of ``.model_name``/``.model``, collapsing every chat
+        span into ``chat:chat``.
+        """
+        agent, observer = build_research_agent(model=scripted_model)
+        agent.invoke({"messages": [HumanMessage(content="research x")]})
+        trace = observer.finalize()
+        graph = aggregate_execution_graph([trace])
+        tool_nodes = {n for n in graph.nodes if n.startswith("execute_tool:")}
+        # The scripted run calls task / search / summarise — three distinct
+        # tools, so three distinct nodes (NOT one collapsed node).
+        assert len(tool_nodes) >= 3, (
+            f"tool spans collapsed into {tool_nodes!r}; expected >=3 distinct "
+            "per-tool nodes (observer must populate metadata['name'])"
+        )
+        # No node should fall back to the bare operation_type label — that's
+        # the collapse signature the fix prevents.
+        assert "execute_tool:execute_tool" not in graph.nodes
+        # Chat spans must use the model's identifier, not collapse to
+        # ``chat:chat``. ScriptedChatModel.model_name = "scripted-test-model".
+        chat_nodes = [n for n in graph.nodes if n.startswith("chat:")]
+        assert chat_nodes, "no chat node in graph"
+        assert all(n != "chat:chat" for n in chat_nodes), (
+            f"chat spans collapsed to chat:chat; got {chat_nodes!r}"
+        )
+        assert any("scripted" in n for n in chat_nodes)
+
 
 # --------------------------------------------------------------------------- #
 # Code-review agent

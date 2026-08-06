@@ -31,11 +31,10 @@ Mapping
 
 from __future__ import annotations
 
-import uuid
 from typing import Any
 
 from ..types import CanonicalTrace, OperationType, SourceProtocol, SpanStatus, TraceSpan
-from .base import TraceAdapter
+from .base import AdapterError, TraceAdapter, _synthetic_id
 
 
 class DeepEvalAdapter(TraceAdapter):
@@ -46,9 +45,9 @@ class DeepEvalAdapter(TraceAdapter):
     def adapt(self, payload: "dict | list | str | bytes") -> CanonicalTrace:
         data = self._decode(payload)
         if not isinstance(data, dict):
-            raise ValueError("deepeval payload must be a dict")
+            raise AdapterError("deepeval payload must be a dict")
 
-        trace_id = data.get("trace_id") or f"deepeval-{uuid.uuid4().hex[:8]}"
+        trace_id = data.get("trace_id") or _synthetic_id("deepeval")
         agent_id = data.get("agent_id") or data.get("user_id") or "deepeval"
         raw_results = data.get("results") or []
         flat_metrics: list[dict[str, Any]] = list(data.get("metrics") or [])

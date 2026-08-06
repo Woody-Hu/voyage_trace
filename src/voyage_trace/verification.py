@@ -74,23 +74,15 @@ Honesty contract
 from __future__ import annotations
 
 import json
-import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any
 
 import yaml
 
+from ._internal import new_id as _new_id, utcnow as _utcnow
 from .analysis import GovernancePlan
 from .execution_graph import ExecutionGraph
-
-
-def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def _new_id(prefix: str) -> str:
-    return f"{prefix}-{uuid.uuid4().hex[:12]}"
 
 
 # --------------------------------------------------------------------------- #
@@ -383,8 +375,9 @@ def verify_plan(
             actual = None
             err_note = "target absent from before-graph — unverifiable"
         else:
-            # Target was in before but compare_graphs did not produce an entry
-            # (defensive; compare_graphs covers all before-nodes).
+            # compare_graphs covers every before-node, so this branch is
+            # unreachable in practice — kept as a defensive guard so a future
+            # change to compare_graphs surfaces here instead of crashing.
             actual = None
             err_note = "no actual savings entry — unverifiable"
         errors.append(ProjectionError(

@@ -210,10 +210,10 @@ def acs_score(
         return ACSVerdict(trace_id=trace_id, verdict=verdict, scores=scores)
 
     # 2. Azure Content Safety SDK path.
-    lf_client = client or _azure_client(endpoint=endpoint, credential=credential)
-    if lf_client is not None:
+    cs_client = client or _azure_client(endpoint=endpoint, credential=credential)
+    if cs_client is not None:
         try:
-            scores = _azure_scores(text, categories=categories, client=lf_client)
+            scores = _azure_scores(text, categories=categories, client=cs_client)
             verdict = "unsafe" if any(not s.pass_ for s in scores) else "safe"
             return ACSVerdict(trace_id=trace_id, verdict=verdict, scores=scores)
         except Exception:  # noqa: BLE001 — fall through to heuristic on Azure failure

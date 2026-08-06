@@ -21,9 +21,10 @@ from __future__ import annotations
 import json
 import re
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
+from ._internal import dt_from_str as _dt_from_str, dt_to_str as _dt_to_str
 from .types import (
     CanonicalTrace,
     OperationType,
@@ -49,8 +50,6 @@ def format_dotted_timestamp(dt: datetime) -> str:
     Naive datetimes are treated as UTC (matching LangSmith's export behaviour);
     aware datetimes are converted to UTC first.
     """
-    from datetime import timezone
-
     if dt.tzinfo is None:
         utc = dt
     else:
@@ -94,20 +93,6 @@ def depth_of(order: str) -> int:
 # --------------------------------------------------------------------------- #
 # JSON serialisation
 # --------------------------------------------------------------------------- #
-def _dt_to_str(dt: datetime | None) -> str | None:
-    if dt is None:
-        return None
-    return dt.isoformat()
-
-
-def _str_to_dt(s: str | None) -> datetime | None:
-    if not s:
-        return None
-    # ``datetime.fromisoformat`` handles ``+00:00`` on 3.11+; for the ``Z``
-    # suffix used in some exports, normalise first.
-    return datetime.fromisoformat(s.replace("Z", "+00:00"))
-
-
 def span_to_dict(span: TraceSpan) -> dict[str, Any]:
     """Serialise a :class:`TraceSpan` to a JSON-safe dict."""
     return {
@@ -155,9 +140,9 @@ def span_from_dict(d: dict[str, Any]) -> TraceSpan:
         agent_version=d.get("agent_version", ""),
         operation_type=OperationType(op) if isinstance(op, str) else op,
         status=SpanStatus(status) if isinstance(status, str) else status,
-        start_time=_str_to_dt(d.get("start_time")) or datetime.fromisoformat("1970-01-01T00:00:00+00:00"),
-        end_time=_str_to_dt(d.get("end_time")),
-        first_token_time=_str_to_dt(d.get("first_token_time")),
+        start_time=_dt_from_str(d.get("start_time")) or datetime.fromisoformat("1970-01-01T00:00:00+00:00"),
+        end_time=_dt_from_str(d.get("end_time")),
+        first_token_time=_dt_from_str(d.get("first_token_time")),
         inputs=d.get("inputs", {}) or {},
         outputs=d.get("outputs"),
         error=d.get("error"),
@@ -166,7 +151,7 @@ def span_from_dict(d: dict[str, Any]) -> TraceSpan:
         output_tokens=int(d.get("output_tokens", 0) or 0),
         cost_usd=float(d.get("cost_usd", 0.0) or 0.0),
         source_protocol=SourceProtocol(src) if isinstance(src, str) else src,
-        recorded_at=_str_to_dt(d.get("recorded_at")) or datetime.fromisoformat("1970-01-01T00:00:00+00:00"),
+        recorded_at=_dt_from_str(d.get("recorded_at")) or datetime.fromisoformat("1970-01-01T00:00:00+00:00"),
     )
 
 

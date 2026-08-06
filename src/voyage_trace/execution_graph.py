@@ -390,9 +390,10 @@ def _mermaid_id(node_id: str) -> str:
 def _detect_bottlenecks(graph: ExecutionGraph) -> list[str]:
     """Heuristic bottleneck detection for the human-readable Bottlenecks section.
 
-    The authoritative finding detection lives in
-    :mod:`voyage_trace.governance.findings`; this is a lightweight summary
-    embedded in the graph document itself.
+    This is a lightweight summary embedded in the graph document itself; the
+    authoritative per-node signal that the governance pipeline acts on lives
+    downstream in :mod:`voyage_trace.automl` (feature importances) and
+    :mod:`voyage_trace.simulator` (projected savings).
     """
     out: list[str] = []
     if not graph.nodes:
@@ -428,7 +429,6 @@ def _detect_bottlenecks(graph: ExecutionGraph) -> list[str]:
 # --------------------------------------------------------------------------- #
 _FRONT_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 _MERMAID_RE = re.compile(r"```mermaid\n(.*?)```", re.DOTALL)
-_NODE_DEF_RE = re.compile(r'^\s*([0-9A-Za-z_]+)\s*(\[\[?"?|\(\[?"?|")?(.*?)["\]\]\)]*\s*$')
 
 
 def parse_markdown(md: str) -> ExecutionGraph:

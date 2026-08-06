@@ -5,13 +5,16 @@ This package exposes:
 * :class:`TraceAdapter` — the abstract base every adapter implements.
 * One concrete adapter per supported :class:`SourceProtocol`:
   :class:`LangSmithAdapter`, :class:`LangfuseAdapter`, :class:`OTELAdapter`,
-  :class:`A2AAdapter`, :class:`MCPAdapter`, :class:`RawAdapter`.
+  :class:`A2AAdapter`, :class:`MCPAdapter`, :class:`RawAdapter`,
+  :class:`DeepEvalAdapter`, :class:`ACSAdapter`.
 * :data:`ADAPTER_REGISTRY` — ``SourceProtocol`` -> adapter class.
 * :func:`adapt` — the single entry point: ``adapt(raw_payload, source_protocol)``.
 
 Adapters depend only on :mod:`voyage_trace.types` and
 :mod:`voyage_trace.protocol`; they parse exported JSON, never call a backend
-SDK.
+SDK. The richer SDK-using helpers (live Azure Content Safety scoring, DeepEval
+dataset round-trips, Langfuse push-side export) live in
+:mod:`voyage_trace.integrations` and are imported lazily.
 """
 
 from __future__ import annotations
@@ -144,4 +147,6 @@ __all__ = [
     "A2AAdapter",
     "MCPAdapter",
     "RawAdapter",
+    "DeepEvalAdapter",
+    "ACSAdapter",
 ]

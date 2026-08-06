@@ -12,19 +12,11 @@ deepagents or LangGraph, so the protocol layer can be used standalone.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime
 from enum import Enum
 from typing import Any
 
-
-def _utcnow() -> datetime:
-    """Return a timezone-aware UTC ``now``.
-
-    A tiny helper so we never accidentally store naive datetimes — naive
-    datetimes are a recurring source of bugs when comparing spans recorded in
-    different timezones.
-    """
-    return datetime.now(timezone.utc)
+from ._internal import utcnow as _utcnow
 
 
 class OperationType(str, Enum):

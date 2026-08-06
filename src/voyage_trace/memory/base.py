@@ -54,9 +54,12 @@ class MemoryPartition(ABC):
     same storage but isolate their data via the namespace convention
     ``memory/<target_agent_id>/<partition_name>/<round_id>``.
 
-    Subclasses MUST implement :meth:`remember`, :meth:`recall`,
-    :meth:`search`, and :meth:`forget`. The shared helpers
-    (:meth:`_ns`, :meth:`_serialize`, :meth:`_deserialize`,
+    Subclasses MUST implement :meth:`remember`. :meth:`recall`,
+    :meth:`search`, and :meth:`forget` have default implementations that
+    talk to the storage through the namespace helpers; a subclass overrides
+    them only when it needs extra behaviour (e.g. :class:`SemanticMemory`
+    applies confidence-threshold filters on top of the default search).
+    The shared helpers (:meth:`_ns`, :meth:`_serialize`, :meth:`_deserialize`,
     :meth:`_base_metadata`, :meth:`_cross_namespace_search`) provide the
     common mechanics so subclasses stay small.
     """
@@ -77,11 +80,11 @@ class MemoryPartition(ABC):
     ) -> None:
         """Write ``value`` under ``key`` in this scope's namespace."""
 
-    @abstractmethod
     async def recall(self, scope: MemoryScope, key: str) -> dict[str, Any] | None:
         """Exact-match read of ``key``. Returns ``None`` if absent."""
+        rec = await self.storage.get(self._ns(scope), key)
+        return self._deserialize(rec.value) if rec else None
 
-    @abstractmethod
     async def search(
         self,
         scope: MemoryScope,
@@ -94,12 +97,30 @@ class MemoryPartition(ABC):
         search spans all matching namespaces (cross-round / cross-agent
         recall).
         """
+        records = await self._query_records(scope, query, limit)
+        return [self._deserialize(r.value) for r in records]
 
-    @abstractmethod
     async def forget(self, scope: MemoryScope, key: str) -> bool:
         """Delete ``key``. Return ``True`` if something was deleted."""
+        return await self.storage.delete(self._ns(scope), key)
 
     # -- shared helpers -------------------------------------------------- #
+
+    async def _query_records(
+        self,
+        scope: MemoryScope,
+        filters: dict[str, Any],
+        limit: int,
+    ) -> list[StorageRecord]:
+        """Equality query with wildcard scope expansion.
+
+        Wildcard scope (``target_agent_id == "*"`` or ``round_id == "*"``)
+        fans out across namespaces via :meth:`_cross_namespace_search`;
+        otherwise the query hits just this scope's namespace.
+        """
+        if scope.target_agent_id == "*" or scope.round_id == "*":
+            return await self._cross_namespace_search(scope, filters, limit)
+        return await self.storage.query(self._ns(scope), filters, limit)
 
     def _ns(self, scope: MemoryScope) -> str:
         """Return the storage namespace for this scope + partition."""
